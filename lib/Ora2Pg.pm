@@ -12359,7 +12359,12 @@ sub _howto_get_data
 	elsif ($self->{is_mssql})
 	{
 		$realtable =~ s/[\[\]]+//g;
-		$realtable = "\[$realtable\]";
+		if (!$self->{schema}) {
+			$realtable = "\[$self->{schema}\].\[$realtable\]";
+		}
+		else {
+			$realtable = "\[$realtable\]";
+		}
 		if (!$self->{schema} && $self->{export_schema}) {
 			$realtable =~ s/\./\].\[/;
 		}
