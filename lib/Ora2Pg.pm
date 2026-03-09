@@ -1215,6 +1215,10 @@ sub _init
 	# Disable ON CONFLICT clause by default
 	$self->{insert_on_conflict} ||= 0;
 
+	# Disable DELETE_ORPHANS by default
+	$self->{delete_orphans} ||= 0;
+	$self->{delete_orphans_batch_size} ||= 10000;
+
 	# Overwrite configuration with all given parameters
 	# and try to preserve backward compatibility
 	foreach my $k (keys %options)
@@ -1406,6 +1410,7 @@ sub _init
 	{
 		$self->{fhlog} = new IO::File;
 		$self->{fhlog}->open(">>$self->{logfile}") or $self->logit("FATAL: can't log to $self->{logfile}, $!\n", 0, 1);
+		$self->{fhlog}->autoflush(1);
 	}
 
 	# Autoconvert SRID
@@ -2140,6 +2145,7 @@ sub _select_output_file_suffix
     $self->{fhlog} = undef;
     $self->{fhlog} = new IO::File;
     $self->{fhlog}->open(">>$self->{dump_as_file_prefix}.$extension") or $self->logit("FATAL: can't log to $self->{dump_as_file_prefix}.$extension, $!\n", 0, 1);
+    $self->{fhlog}->autoflush(1);
     if ($self->{debug}){
         print STDERR  "Saving report to $self->{dump_as_file_prefix}.$extension\n";
     }
@@ -10372,6 +10378,12 @@ sub _get_sql_statements
 					push @datadiff_ins, $tmptb_ins;
 				}
 
+				# DELETE_ORPHANS: remove rows from PostgreSQL target that no longer exist in source
+				if ($self->{delete_orphans} && $self->{pg_dsn})
+				{
+					$self->_delete_orphans($table, $tmptb);
+				}
+
 				# disable triggers of current table if requested
 				if ($self->{disable_triggers} && !$self->{oracle_speed})
 				{
@@ -17512,6 +17524,167 @@ sub _dump_to_pg
 		unlink($tempfiles[0]->[1]) if (-e $tempfiles[0]->[1]);
 	}
 }
+
+
+####
+# Delete orphan rows from PostgreSQL that no longer exist in source
+####
+sub _delete_orphans
+{
+	my ($self, $table, $tmptb) = @_;
+
+	my @pk_cols = @{ $self->{tables}{$table}{pg_colnames_pkey} };
+	if ($#pk_cols < 0)
+	{
+		$self->logit("WARNING: table $table has no primary key, skipping DELETE_ORPHANS.\n", 0);
+		return;
+	}
+
+	$self->logit("DELETE_ORPHANS: processing table $table (PK: " . join(', ', @pk_cols) . ")...\n", 1);
+	$0 = "ora2pg - delete_orphans from table $table";
+
+	# Get source PK column names (original names, not PG-renamed)
+	my @src_pk_cols = ();
+	foreach my $consname (keys %{ $self->{tables}{$table}{unique_key} }) {
+		next if ($self->{tables}{$table}{unique_key}->{$consname}{type} ne 'P');
+		@src_pk_cols = @{$self->{tables}{$table}{unique_key}->{$consname}{columns}};
+		last;
+	}
+	if ($#src_pk_cols < 0)
+	{
+		$self->logit("WARNING: cannot find source PK columns for table $table, skipping DELETE_ORPHANS.\n", 0);
+		return;
+	}
+
+	# Build source table name (same logic as _howto_get_data)
+	my $realtable = $table;
+	$realtable =~ s/"//g;
+	if ($self->{is_mysql})
+	{
+		$realtable =~ s/`//g;
+		$realtable = "`$realtable`";
+	}
+	elsif ($self->{is_mssql})
+	{
+		$realtable =~ s/[\[\]]+//g;
+		if ($self->{schema}) {
+			$realtable = "[$self->{schema}].[$realtable]";
+		} else {
+			$realtable = "[$realtable]";
+		}
+	}
+	else
+	{
+		my $owner = $self->{tables}{$table}{table_info}{owner} || $self->{tables}{$table}{owner} || '';
+		if ($owner)
+		{
+			$owner =~ s/"//g;
+			$owner = "\"$owner\"";
+			$realtable = "$owner.\"$realtable\"";
+		}
+		else
+		{
+			$realtable = "\"$realtable\"";
+		}
+	}
+
+	# Create temp table on PostgreSQL cloning PK columns from target
+	my $tmp_pk_table = '_ora2pg_delete_orphans_' . lc($table);
+	$tmp_pk_table =~ s/["\[\]`]//g;
+	$tmp_pk_table =~ s/\./_/g;
+	my $pk_cols_str = join(', ', @pk_cols);
+
+	$self->logit("DELETE_ORPHANS: creating temp table $tmp_pk_table...\n", 1);
+	my $create_sql = "CREATE TEMP TABLE $tmp_pk_table AS SELECT $pk_cols_str FROM $tmptb WHERE FALSE";
+	$self->{dbhdest}->do($create_sql) or do {
+		$self->logit("WARNING: failed to create temp table for DELETE_ORPHANS on $table: " . $self->{dbhdest}->errstr . "\n", 0);
+		return;
+	};
+
+	# Query source for all PKs
+	my $src_pk_str = join(', ', map { $self->{is_mysql} ? "`$_`" : $self->{is_mssql} ? "[$_]" : "\"$_\"" } @src_pk_cols);
+	my $src_query = "SELECT $src_pk_str FROM $realtable";
+	$self->logit("DELETE_ORPHANS: querying source PKs: $src_query\n", 1);
+
+	my $sth = $self->{dbh}->prepare($src_query) or do {
+		$self->logit("WARNING: failed to query source PKs for DELETE_ORPHANS on $table: " . $self->{dbh}->errstr . "\n", 0);
+		$self->{dbhdest}->do("DROP TABLE IF EXISTS $tmp_pk_table");
+		return;
+	};
+	$sth->execute() or do {
+		$self->logit("WARNING: failed to execute source PK query for DELETE_ORPHANS on $table: " . $self->{dbh}->errstr . "\n", 0);
+		$self->{dbhdest}->do("DROP TABLE IF EXISTS $tmp_pk_table");
+		return;
+	};
+
+	# Insert PKs into temp table in batches
+	my $batch_size = $self->{delete_orphans_batch_size} || 10000;
+	my $placeholders = '(' . join(',', map { '?' } @pk_cols) . ')';
+	my $total_pks = 0;
+	my @batch = ();
+
+	while (my $row = $sth->fetchrow_arrayref())
+	{
+		push @batch, [@$row];
+		if (scalar @batch >= $batch_size)
+		{
+			my $values = join(',', map { $placeholders } @batch);
+			my $insert_sql = "INSERT INTO $tmp_pk_table ($pk_cols_str) VALUES $values";
+			my @params = map { @$_ } @batch;
+			$self->{dbhdest}->do($insert_sql, undef, @params) or do {
+				$self->logit("WARNING: failed to insert PKs batch for DELETE_ORPHANS on $table: " . $self->{dbhdest}->errstr . "\n", 0);
+				$sth->finish();
+				$self->{dbhdest}->do("DROP TABLE IF EXISTS $tmp_pk_table");
+				return;
+			};
+			$total_pks += scalar @batch;
+			@batch = ();
+		}
+	}
+	# Insert remaining rows
+	if (scalar @batch > 0)
+	{
+		my $values = join(',', map { $placeholders } @batch);
+		my $insert_sql = "INSERT INTO $tmp_pk_table ($pk_cols_str) VALUES $values";
+		my @params = map { @$_ } @batch;
+		$self->{dbhdest}->do($insert_sql, undef, @params) or do {
+			$self->logit("WARNING: failed to insert PKs batch for DELETE_ORPHANS on $table: " . $self->{dbhdest}->errstr . "\n", 0);
+			$sth->finish();
+			$self->{dbhdest}->do("DROP TABLE IF EXISTS $tmp_pk_table");
+			return;
+		};
+		$total_pks += scalar @batch;
+	}
+	$sth->finish();
+
+	$self->logit("DELETE_ORPHANS: loaded $total_pks PKs from source for table $table\n", 1);
+
+	# Create index on temp table for performance
+	$self->{dbhdest}->do("CREATE INDEX ON $tmp_pk_table ($pk_cols_str)");
+
+	# Analyze temp table
+	$self->{dbhdest}->do("ANALYZE $tmp_pk_table");
+
+	# Delete orphan rows from target
+	my $join_cond = join(' AND ', map { "$tmptb.$_ = $tmp_pk_table.$_" } @pk_cols);
+	my $delete_sql = "DELETE FROM $tmptb WHERE NOT EXISTS (SELECT 1 FROM $tmp_pk_table WHERE $join_cond)";
+	$self->logit("DELETE_ORPHANS: executing: $delete_sql\n", 1);
+
+	my $deleted = $self->{dbhdest}->do($delete_sql);
+	if (!defined $deleted)
+	{
+		$self->logit("WARNING: failed to delete orphans from $table: " . $self->{dbhdest}->errstr . "\n", 0);
+	}
+	else
+	{
+		$deleted = 0 if ($deleted eq '0E0');
+		$self->logit("DELETE_ORPHANS: deleted $deleted orphan rows from table $table\n", 0);
+	}
+
+	# Drop temp table
+	$self->{dbhdest}->do("DROP TABLE IF EXISTS $tmp_pk_table");
+}
+
 
 sub _pload_to_pg
 {

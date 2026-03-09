@@ -1935,6 +1935,38 @@ the DELETE definition.
 
 These DELETE clauses might be useful with regular "updates".
 
+=item DELETE_ORPHANS
+
+When enabled, this directive instructs Ora2Pg to delete rows from the
+PostgreSQL target table that no longer exist in the source database, based
+on the primary key. This is useful for incremental synchronization scenarios
+where you want to keep the target in sync without using TRUNCATE_TABLE.
+
+It works only with direct import (PG_DSN must be set) and requires that the
+target table has a primary key defined. Tables without a primary key are
+skipped with a warning.
+
+The process is:
+
+	1. After data export, query the source for all primary key values.
+	2. Load them into a temporary table on PostgreSQL in batches.
+	3. Delete rows from the target where the primary key does not exist
+	   in the temporary table.
+	4. Drop the temporary table.
+
+This is much lighter than DATADIFF because only primary key columns are
+transferred, not the full row data.
+
+Can be combined with INSERT_ON_CONFLICT to achieve a full UPSERT + DELETE
+synchronization without any downtime.
+
+=item DELETE_ORPHANS_BATCH_SIZE
+
+Number of primary key rows to insert into the temporary table per batch
+during DELETE_ORPHANS processing. Default is 10000. Increase this value
+for better performance on large tables, decrease it if you encounter
+memory issues.
+
 =item STOP_ON_ERROR
 
 Set this parameter to 0 to not include the call to \set ON_ERROR_STOP ON in
