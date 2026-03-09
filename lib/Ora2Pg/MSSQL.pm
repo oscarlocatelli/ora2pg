@@ -249,18 +249,18 @@ sub _table_info
 
         my $schema_clause = '';
         $schema_clause = " AND s.name='$self->{schema}'" if ($self->{schema});
-	my $sql = qq{SELECT t.NAME AS TABLE_NAME, NULL AS comment, t.type_desc as TABLE_TYPE, p.rows AS RowCounts, SUM(a.used_pages)  * 8 / 1024 AS UsedSpaceMB, CONVERT(DECIMAL,SUM(a.total_pages)) * 8 / 1024 AS TotalSpaceMB, s.Name AS TABLE_SCHEMA, SCHEMA_NAME(t.principal_id), i.type_desc, p.data_compression_desc
+	my $sql = qq{SELECT t.name AS TABLE_NAME, NULL AS comment, t.type_desc as TABLE_TYPE, p.rows AS RowCounts, SUM(a.used_pages)  * 8 / 1024 AS UsedSpaceMB, CONVERT(DECIMAL,SUM(a.total_pages)) * 8 / 1024 AS TotalSpaceMB, s.name AS TABLE_SCHEMA, SCHEMA_NAME(t.principal_id), i.type_desc, p.data_compression_desc
 FROM sys.tables t
-INNER JOIN sys.indexes i ON t.OBJECT_ID = i.object_id
-INNER JOIN sys.partitions p ON i.object_id = p.OBJECT_ID AND i.index_id = p.index_id
+INNER JOIN sys.indexes i ON t.object_id = i.object_id
+INNER JOIN sys.partitions p ON i.object_id = p.object_id AND i.index_id = p.index_id
 INNER JOIN sys.allocation_units a ON p.partition_id = a.container_id
 LEFT OUTER JOIN sys.schemas s ON t.schema_id = s.schema_id
-WHERE t.is_ms_shipped = 0 AND i.OBJECT_ID > 255 AND t.type='U' AND t.NAME NOT LIKE '#%' $schema_clause
+WHERE t.is_ms_shipped = 0 AND i.object_id > 255 AND t.type='U' AND t.name NOT LIKE '#%' $schema_clause
 };
 	my %tables_infos = ();
 	my %comments = ();
-	$sql .= $self->limit_to_objects('TABLE', 't.Name');
-	$sql .= " GROUP BY t.type_desc, i.type_desc, s.Name, t.Name, SCHEMA_NAME(t.principal_id), p.Rows, p.data_compression_desc ORDER BY s.Name, t.Name";
+	$sql .= $self->limit_to_objects('TABLE', 't.name');
+	$sql .= " GROUP BY t.type_desc, i.type_desc, s.name, t.name, SCHEMA_NAME(t.principal_id), p.rows, p.data_compression_desc ORDER BY s.name, t.name";
 	my $sth = $self->{dbh}->prepare( $sql ) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
 	$sth->execute(@{$self->{query_bind_params}}) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
 	while (my $row = $sth->fetch)
@@ -332,7 +332,7 @@ sub _column_info
 
 	my $str = qq{SELECT 
     c.name 'Column Name',
-    t.Name 'Data type',
+    t.name 'Data type',
     c.max_length 'Max Length',
     c.is_nullable,
     object_definition(c.default_object_id),
@@ -407,7 +407,7 @@ sub _get_indexes
 		$condition .= " AND s.name NOT IN ('" . join("','", @{$self->{sysusers}}) . "') ";
 	}
 	if (!$table) {
-		$condition .= $self->limit_to_objects('TABLE|INDEX', "OBJECT_NAME(Id.object_id, DB_ID())|Id.NAME");
+		$condition .= $self->limit_to_objects('TABLE|INDEX', "OBJECT_NAME(Id.object_id, DB_ID())|Id.name");
 	} else {
 		@{$self->{query_bind_params}} = ();
 	}
@@ -422,15 +422,15 @@ sub _get_indexes
 
 	my $t0 = Benchmark->new;
 	my $sth = '';
-	my $sql = qq{SELECT Id.name AS index_name, AC.name AS column_name, Id.is_unique AS UNIQUENESS, AC.column_id AS COLUMN_POSITION, Id.type AS INDEX_TYPE, 'U' AS TABLE_TYPE, $col_generated AS GENERATED, NULL AS JOIN_INDEX, t.name AS TABLE_NAME, s.name as TABLE_SCHEMA, Id.data_space_id AS TABLESPACE_NAME, Id.type_desc AS ITYP_NAME, Id.filter_definition AS PARAMETERS, IC.is_descending_key AS DESCEND, id.is_primary_key PRIMARY_KEY, typ.name AS COL_TYPE_NAME, IC.is_included_column
-FROM sys.tables AS T
-INNER JOIN sys.indexes Id ON T.object_id = Id.object_id
+	my $sql = qq{SELECT Id.name AS index_name, AC.name AS column_name, Id.is_unique AS UNIQUENESS, AC.column_id AS COLUMN_POSITION, Id.type AS INDEX_TYPE, 'U' AS TABLE_TYPE, $col_generated AS GENERATED, NULL AS JOIN_INDEX, t.name AS TABLE_NAME, s.name as TABLE_SCHEMA, Id.data_space_id AS TABLESPACE_NAME, Id.type_desc AS ITYP_NAME, Id.filter_definition AS PARAMETERS, IC.is_descending_key AS DESCEND, Id.is_primary_key PRIMARY_KEY, typ.name AS COL_TYPE_NAME, IC.is_included_column
+FROM sys.tables AS t
+INNER JOIN sys.indexes Id ON t.object_id = Id.object_id
 INNER JOIN sys.index_columns IC ON Id.object_id = IC.object_id AND Id.index_id = IC.index_id
 INNER JOIN sys.all_columns AC ON IC.object_id =  AC.object_id AND IC.column_id = AC.column_id
 INNER JOIN sys.types typ ON typ.user_type_id = AC.user_type_id
 LEFT OUTER JOIN sys.schemas s ON t.schema_id = s.schema_id
-WHERE T.is_ms_shipped = 0 $generated $condition
-ORDER BY T.name, Id.index_id, IC.key_ordinal
+WHERE t.is_ms_shipped = 0 $generated $condition
+ORDER BY t.name, Id.index_id, IC.key_ordinal
 };
 
 	$sth = $self->{dbh}->prepare($sql) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
@@ -640,7 +640,8 @@ WHERE NOT EXISTS (SELECT 1 FROM sys.indexes i WHERE i.object_id = v.object_id an
 		if (!$self->{schema} && $self->{export_schema}) {
 			$row->[0] = "$row->[1].$row->[0]";
 		}
-		$row->[2] =~ s///g;
+		$row->[2] =~ s/
+//g;
 		$row->[2] =~ s/[\[\]]//g;
 		$row->[2] =~ s/^.*\bCREATE VIEW\s+[^\s]+\s+AS\s+//is;
 		$data{$row->[0]}{text} = $row->[2];
@@ -703,7 +704,8 @@ WHERE o.type = 'TR'
 		if (!$self->{schema} && $self->{export_schema}) {
 			$row->[2] = "$row->[3].$row->[2]";
 		}
-		$row->[10] =~ s///g;
+		$row->[10] =~ s/
+//g;
 		$row->[10] =~ s/^(?:.*?)\sAS\s(.*)\s*;\s*$/$1/is;
 		push(@triggers, [ ($row->[0], $row->[4], $act, $row->[2], $row->[10], '', 'ROW', $row->[1]) ]);
 	}
@@ -817,7 +819,7 @@ LEFT OUTER JOIN sys.objects t ON con.parent_object_id = t.object_id
 JOIN sys.schemas AS s ON t.schema_id = s.schema_id
 LEFT OUTER JOIN sys.all_columns col ON con.parent_column_id = col.column_id AND con.parent_object_id = col.object_id
 $condition
-ORDER BY SchemaName, t.Name, col.name
+ORDER BY SchemaName, t.name, col.name
 };
 
         my $sth = $self->{dbh}->prepare($sql) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
@@ -865,18 +867,18 @@ sub _get_functions
 
 	# Retrieve all functions 
 	my $str = qq{SELECT
-    O.name, M.definition, O.type_desc, s.name, M.null_on_null_input,
-    M.execute_as_principal_id
-FROM sys.sql_modules M
-JOIN sys.objects O ON M.object_id=O.object_id
+    o.name, m.definition, o.type_desc, s.name, m.null_on_null_input,
+    m.execute_as_principal_id
+FROM sys.sql_modules m
+JOIN sys.objects o ON m.object_id=o.object_id
 JOIN sys.schemas AS s ON o.schema_id = s.schema_id
-WHERE O.type IN ('IF','TF','FN')
+WHERE o.type IN ('IF','TF','FN')
 };
 	if ($self->{schema}) {
 		$str .= " AND s.name = '$self->{schema}'";
 	}
-	$str .= " " . $self->limit_to_objects('FUNCTION','O.name');
-	$str .= " ORDER BY O.name";
+	$str .= " " . $self->limit_to_objects('FUNCTION','o.name');
+	$str .= " ORDER BY o.name";
 	my $sth = $self->{dbh}->prepare($str) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
 	$sth->execute(@{$self->{query_bind_params}}) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
 
@@ -894,7 +896,8 @@ WHERE O.type IN ('IF','TF','FN')
 		$functions{"$row->[0]"}{kind} = $row->[2];
 		$functions{"$row->[0]"}{strict} = $row->[4];
 		$functions{"$row->[0]"}{security} = ($row->[5] == -2) ? 'DEFINER' : 'EXECUTER';
-		$functions{"$row->[0]"}{text} =~ s///gs;
+		$functions{"$row->[0]"}{text} =~ s/
+//gs;
 		if ($self->{plsql_pgsql})
 		{
 			$functions{"$row->[0]"}{text} =~ s/[\[\]]//gs;
@@ -910,18 +913,18 @@ sub _get_procedures
 
 	# Retrieve all functions 
 	my $str = qq{SELECT
-    O.name, M.definition, O.type_desc, s.name, M.null_on_null_input,
-    M.execute_as_principal_id
-FROM sys.sql_modules M
-JOIN sys.objects O ON M.object_id=O.object_id
+    o.name, m.definition, o.type_desc, s.name, m.null_on_null_input,
+    m.execute_as_principal_id
+FROM sys.sql_modules m
+JOIN sys.objects o ON m.object_id=o.object_id
 JOIN sys.schemas AS s ON o.schema_id = s.schema_id
-WHERE O.type = 'P'
+WHERE o.type = 'P'
 };
 	if ($self->{schema}) {
 		$str .= " AND s.name = '$self->{schema}'";
 	}
-	$str .= " " . $self->limit_to_objects('PROCEDURE','O.name');
-	$str .= " ORDER BY O.name";
+	$str .= " " . $self->limit_to_objects('PROCEDURE','o.name');
+	$str .= " ORDER BY o.name";
 	my $sth = $self->{dbh}->prepare($str) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
 	$sth->execute(@{$self->{query_bind_params}}) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
 
@@ -939,7 +942,8 @@ WHERE O.type = 'P'
 		$functions{"$row->[0]"}{kind} = $row->[2];
 		$functions{"$row->[0]"}{strict} = $row->[4];
 		$functions{"$row->[0]"}{security} = ($row->[5] == -2) ? 'DEFINER' : 'EXECUTER';
-		$functions{"$row->[0]"}{text} =~ s///gs;
+		$functions{"$row->[0]"}{text} =~ s/
+//gs;
 		if ($self->{plsql_pgsql}) {
 			$functions{"$row->[0]"}{text} =~ s/[\[\]]//gs;
 		}
@@ -1793,7 +1797,7 @@ sub _get_objects
 	my %infos = ();
 
 	# TABLE
-	my $sql = "SELECT t.name FROM sys.tables t INNER JOIN sys.indexes i ON t.OBJECT_ID = i.object_id INNER JOIN sys.partitions p ON i.object_id = p.OBJECT_ID AND i.index_id = p.index_id LEFT OUTER JOIN sys.schemas s ON t.schema_id = s.schema_id WHERE t.is_ms_shipped = 0 AND i.OBJECT_ID > 255 AND t.type='U' AND t.NAME NOT LIKE '#%'";
+	my $sql = "SELECT t.name FROM sys.tables t INNER JOIN sys.indexes i ON t.object_id = i.object_id INNER JOIN sys.partitions p ON i.object_id = p.object_id AND i.index_id = p.index_id LEFT OUTER JOIN sys.schemas s ON t.schema_id = s.schema_id WHERE t.is_ms_shipped = 0 AND i.object_id > 255 AND t.type='U' AND t.name NOT LIKE '#%'";
 	if (!$self->{schema}) {
 		$sql .= " AND s.name NOT IN ('" . join("','", @{$self->{sysusers}}) . "')";
 	} else {
@@ -1838,7 +1842,7 @@ sub _get_objects
 		if ($self->{db_version} !~ /SQL Server 201[0-6]/) {
 			$auto_generated = ' AND Id.auto_created = 0';
 		}
-		my $sql = "SELECT Id.name AS index_name FROM sys.tables AS T INNER JOIN sys.indexes Id ON T.object_id = Id.object_id LEFT OUTER JOIN sys.schemas s ON t.schema_id = s.schema_id WHERE T.is_ms_shipped = 0 AND OBJECT_NAME(Id.object_id, DB_ID())='$t' AND Id.is_primary_key = 0$auto_generated";
+		my $sql = "SELECT Id.name AS index_name FROM sys.tables AS t INNER JOIN sys.indexes Id ON t.object_id = Id.object_id LEFT OUTER JOIN sys.schemas s ON t.schema_id = s.schema_id WHERE t.is_ms_shipped = 0 AND OBJECT_NAME(Id.object_id, DB_ID())='$t' AND Id.is_primary_key = 0$auto_generated";
 		if (!$self->{schema}) {
 			$sql .= " AND s.name NOT IN ('" . join("','", @{$self->{sysusers}}) . "')";
 		} else {
@@ -1852,7 +1856,7 @@ sub _get_objects
 		}
 	}
 	# FUNCTION
-	$sql = "SELECT O.name FROM sys.sql_modules M JOIN sys.objects O ON M.object_id=O.object_id JOIN sys.schemas AS s ON o.schema_id = s.schema_id WHERE O.type IN ('IF','TF','FN')";
+	$sql = "SELECT o.name FROM sys.sql_modules m JOIN sys.objects o ON m.object_id=o.object_id JOIN sys.schemas AS s ON o.schema_id = s.schema_id WHERE o.type IN ('IF','TF','FN')";
 	if (!$self->{schema}) {
 		 $sql .= " AND s.name NOT IN ('" . join("','", @{$self->{sysusers}}) . "')";
 	} else {
@@ -1866,7 +1870,7 @@ sub _get_objects
 	$sth->finish();
 
 	# PROCEDURE
-	$sql = "SELECT O.name FROM sys.sql_modules M JOIN sys.objects O ON M.object_id=O.object_id JOIN sys.schemas AS s ON o.schema_id = s.schema_id WHERE O.type = 'P'";
+	$sql = "SELECT o.name FROM sys.sql_modules m JOIN sys.objects o ON m.object_id=o.object_id JOIN sys.schemas AS s ON o.schema_id = s.schema_id WHERE o.type = 'P'";
 	if (!$self->{schema}) {
 		 $sql .= " AND s.name NOT IN ('" . join("','", @{$self->{sysusers}}) . "')";
 	} else {
@@ -2030,17 +2034,17 @@ sub _get_largest_tables
 
         my $schema_clause = '';
         $schema_clause = " AND s.name='$self->{schema}'" if ($self->{schema});
-	my $sql = qq{SELECT t.NAME AS TABLE_NAME, p.rows AS RowCounts, SUM(a.used_pages)  * 8 / 1024 AS UsedSpaceMB, CONVERT(DECIMAL,SUM(a.total_pages)) * 8 / 1024 AS TotalSpaceMB, s.Name AS TABLE_SCHEMA
+	my $sql = qq{SELECT t.name AS TABLE_NAME, p.rows AS RowCounts, SUM(a.used_pages)  * 8 / 1024 AS UsedSpaceMB, CONVERT(DECIMAL,SUM(a.total_pages)) * 8 / 1024 AS TotalSpaceMB, s.name AS TABLE_SCHEMA
 FROM sys.tables t
-INNER JOIN sys.indexes i ON t.OBJECT_ID = i.object_id
-INNER JOIN sys.partitions p ON i.object_id = p.OBJECT_ID AND i.index_id = p.index_id
+INNER JOIN sys.indexes i ON t.object_id = i.object_id
+INNER JOIN sys.partitions p ON i.object_id = p.object_id AND i.index_id = p.index_id
 INNER JOIN sys.allocation_units a ON p.partition_id = a.container_id
 LEFT OUTER JOIN sys.schemas s ON t.schema_id = s.schema_id
-WHERE t.is_ms_shipped = 0 AND i.OBJECT_ID > 255 AND t.type='U' $schema_clause
+WHERE t.is_ms_shipped = 0 AND i.object_id > 255 AND t.type='U' $schema_clause
 };
 
-	$sql .= $self->limit_to_objects('TABLE', 't.Name');
-	$sql .= " GROUP BY t.NAME ORDER BY TotalSpaceMB";
+	$sql .= $self->limit_to_objects('TABLE', 't.name');
+	$sql .= " GROUP BY t.name ORDER BY TotalSpaceMB";
 	$sql .= " LIMIT $self->{top_max}" if ($self->{top_max});
 
         my $sth = $self->{dbh}->prepare( $sql ) or return undef;
@@ -2301,7 +2305,7 @@ sub _column_attributes
     c.is_nullable,
     object_definition(c.default_object_id),
     tb.name,
-    t.Name 'Data type',
+    t.name 'Data type',
     c.column_id,
     s.name
 FROM sys.columns c
@@ -2627,7 +2631,8 @@ join sys.sql_modules m on m.object_id = v.object_id
 		if (!$self->{schema} && $self->{export_schema}) {
 			$row->[0] = "$row->[1].$row->[0]";
 		}
-		$row->[3] =~ s///g;
+		$row->[3] =~ s/
+//g;
 		$row->[3] =~ s/[\[\]]//g;
 		$row->[3] =~ s/^CREATE VIEW [^\s]+//;
 		$data{$row->[0]}{text} = $row->[3];

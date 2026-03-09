@@ -1709,7 +1709,7 @@ sub _init
 	$self->{pg_integer_type} = 1 if (not defined $self->{pg_integer_type});
 	# Backward compatibility with CASE_SENSITIVE
 	$self->{preserve_case} = $self->{case_sensitive} if (defined $self->{case_sensitive} && not defined $self->{preserve_case});
-	$self->{schema} = uc($self->{schema}) if (!$self->{preserve_case} && ($self->{oracle_dsn} !~ /:mysql/i));
+	#$self->{schema} = uc($self->{schema}) if (!$self->{preserve_case} && ($self->{oracle_dsn} !~ /:mysql/i));
 	# With MySQL override schema with the database name
 	if ($self->{oracle_dsn} =~ /:mysql:.*database=([^;]+)/i)
 	{
@@ -12359,7 +12359,7 @@ sub _howto_get_data
 	elsif ($self->{is_mssql})
 	{
 		$realtable =~ s/[\[\]]+//g;
-		if (!$self->{schema}) {
+		if ($self->{schema}) {
 			$realtable = "\[$self->{schema}\].\[$realtable\]";
 		}
 		else {
@@ -20809,7 +20809,7 @@ sub limit_to_objects
 	$str =~ s/ AND \(\)//g;
 	$str =~ s/ OR \(\)//g;
 
-	return uc($str);
+	return $str;
 }
 
 
