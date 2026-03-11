@@ -2315,11 +2315,12 @@ sub _send_to_pgdb
 	$ENV{PGAPPNAME} = 'ora2pg ' || $VERSION;
 
 	# Connect the destination database
+	$self->logit("DEBUG _send_to_pgdb: pg_dsn='$self->{pg_dsn}' pg_user='$self->{pg_user}'\n", 1);
 	my $dbhdest = DBI->connect($self->{pg_dsn}, $self->{pg_user}, $self->{pg_pwd}, {AutoInactiveDestroy => 1, PrintError => 0});
 
 	# Check for connection failure
 	if (!$dbhdest) {
-		$self->logit("FATAL: $DBI::err ... $DBI::errstr\n", 0, 1);
+		$self->logit("FATAL: $DBI::err ... $DBI::errstr (pg_dsn was: '$self->{pg_dsn}')\n", 0, 1);
 	}
 
 	# Force execution of initial command
