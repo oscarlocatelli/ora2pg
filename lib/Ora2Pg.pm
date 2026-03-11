@@ -17594,10 +17594,22 @@ sub _delete_orphans
 	$tmp_pk_table =~ s/\./_/g;
 	my $pk_cols_str = join(', ', @pk_cols);
 
+	# Use a dedicated connection for DELETE_ORPHANS to avoid interfering
+	# with the post-export transaction on $self->{dbhdest}
+	my $orphan_dbh = $self->_send_to_pgdb();
+	if (!$orphan_dbh)
+	{
+		$self->logit("WARNING: failed to connect to PostgreSQL for DELETE_ORPHANS on $table\n", 0);
+		return;
+	}
+	my $search_path = $self->set_search_path();
+	$orphan_dbh->do($search_path) if ($search_path);
+
 	$self->logit("DELETE_ORPHANS: creating temp table $tmp_pk_table...\n", 1);
 	my $create_sql = "CREATE TEMP TABLE $tmp_pk_table AS SELECT $pk_cols_str FROM $tmptb WHERE FALSE";
-	$self->{dbhdest}->do($create_sql) or do {
-		$self->logit("WARNING: failed to create temp table for DELETE_ORPHANS on $table: " . $self->{dbhdest}->errstr . "\n", 0);
+	$orphan_dbh->do($create_sql) or do {
+		$self->logit("WARNING: failed to create temp table for DELETE_ORPHANS on $table: " . $orphan_dbh->errstr . "\n", 0);
+		$orphan_dbh->disconnect();
 		return;
 	};
 
@@ -17608,12 +17620,12 @@ sub _delete_orphans
 
 	my $sth = $self->{dbh}->prepare($src_query) or do {
 		$self->logit("WARNING: failed to query source PKs for DELETE_ORPHANS on $table: " . $self->{dbh}->errstr . "\n", 0);
-		$self->{dbhdest}->do("DROP TABLE IF EXISTS $tmp_pk_table");
+		$orphan_dbh->disconnect();
 		return;
 	};
 	$sth->execute() or do {
 		$self->logit("WARNING: failed to execute source PK query for DELETE_ORPHANS on $table: " . $self->{dbh}->errstr . "\n", 0);
-		$self->{dbhdest}->do("DROP TABLE IF EXISTS $tmp_pk_table");
+		$orphan_dbh->disconnect();
 		return;
 	};
 
@@ -17631,10 +17643,10 @@ sub _delete_orphans
 			my $values = join(',', map { $placeholders } @batch);
 			my $insert_sql = "INSERT INTO $tmp_pk_table ($pk_cols_str) VALUES $values";
 			my @params = map { @$_ } @batch;
-			$self->{dbhdest}->do($insert_sql, undef, @params) or do {
-				$self->logit("WARNING: failed to insert PKs batch for DELETE_ORPHANS on $table: " . $self->{dbhdest}->errstr . "\n", 0);
+			$orphan_dbh->do($insert_sql, undef, @params) or do {
+				$self->logit("WARNING: failed to insert PKs batch for DELETE_ORPHANS on $table: " . $orphan_dbh->errstr . "\n", 0);
 				$sth->finish();
-				$self->{dbhdest}->do("DROP TABLE IF EXISTS $tmp_pk_table");
+				$orphan_dbh->disconnect();
 				return;
 			};
 			$total_pks += scalar @batch;
@@ -17647,10 +17659,10 @@ sub _delete_orphans
 		my $values = join(',', map { $placeholders } @batch);
 		my $insert_sql = "INSERT INTO $tmp_pk_table ($pk_cols_str) VALUES $values";
 		my @params = map { @$_ } @batch;
-		$self->{dbhdest}->do($insert_sql, undef, @params) or do {
-			$self->logit("WARNING: failed to insert PKs batch for DELETE_ORPHANS on $table: " . $self->{dbhdest}->errstr . "\n", 0);
+		$orphan_dbh->do($insert_sql, undef, @params) or do {
+			$self->logit("WARNING: failed to insert PKs batch for DELETE_ORPHANS on $table: " . $orphan_dbh->errstr . "\n", 0);
 			$sth->finish();
-			$self->{dbhdest}->do("DROP TABLE IF EXISTS $tmp_pk_table");
+			$orphan_dbh->disconnect();
 			return;
 		};
 		$total_pks += scalar @batch;
@@ -17660,20 +17672,20 @@ sub _delete_orphans
 	$self->logit("DELETE_ORPHANS: loaded $total_pks PKs from source for table $table\n", 1);
 
 	# Create index on temp table for performance
-	$self->{dbhdest}->do("CREATE INDEX ON $tmp_pk_table ($pk_cols_str)");
+	$orphan_dbh->do("CREATE INDEX ON $tmp_pk_table ($pk_cols_str)");
 
 	# Analyze temp table
-	$self->{dbhdest}->do("ANALYZE $tmp_pk_table");
+	$orphan_dbh->do("ANALYZE $tmp_pk_table");
 
 	# Delete orphan rows from target
 	my $join_cond = join(' AND ', map { "$tmptb.$_ = $tmp_pk_table.$_" } @pk_cols);
 	my $delete_sql = "DELETE FROM $tmptb WHERE NOT EXISTS (SELECT 1 FROM $tmp_pk_table WHERE $join_cond)";
 	$self->logit("DELETE_ORPHANS: executing: $delete_sql\n", 1);
 
-	my $deleted = $self->{dbhdest}->do($delete_sql);
+	my $deleted = $orphan_dbh->do($delete_sql);
 	if (!defined $deleted)
 	{
-		$self->logit("WARNING: failed to delete orphans from $table: " . $self->{dbhdest}->errstr . "\n", 0);
+		$self->logit("WARNING: failed to delete orphans from $table: " . $orphan_dbh->errstr . "\n", 0);
 	}
 	else
 	{
@@ -17681,8 +17693,8 @@ sub _delete_orphans
 		$self->logit("DELETE_ORPHANS: deleted $deleted orphan rows from table $table\n", 0);
 	}
 
-	# Drop temp table
-	$self->{dbhdest}->do("DROP TABLE IF EXISTS $tmp_pk_table");
+	# Cleanup
+	$orphan_dbh->disconnect();
 }
 
 
