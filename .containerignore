@@ -1,0 +1,12 @@
+# Contesto di build: il build parte dalla root del repo
+# (podman build -f containers/Containerfile .), quindi questo file sta alla root.
+.git/
+.kilo/
+.claude/
+containers/out/
+out/
+config/
+*.log
+output.sql
+ora_export_*.sql
+blib/

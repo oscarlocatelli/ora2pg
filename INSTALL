@@ -1,3 +1,71 @@
+============================================================================
+USO DEI CONTAINER PODMAN (Oracle + SQL Server)
+============================================================================
 
-  See README file.
+Immagini UBI10 multi-stage (solo linux/amd64), verificate il 2026-09-07:
+  ora2pg:mssql   ~156 MB   export da SQL Server (DBD::ODBC + msodbcsql18 18.6.2.1)
+  ora2pg:oracle  ~399 MB   export da Oracle (DBD::Oracle 1.95 + Instant Client 19.27)
 
+Dettagli build, smoke test e versioni pinnate: containers/SMOKE.md
+Esempio config: containers/ora2pg.conf.example
+
+1. PREREQUISITI
+   - Podman funzionante; build dalla root del repo.
+   - Target oracle: i 4 RPM 19.27 el9 in vendor/oracle-instantclient/
+     (basic+devel+sqlplus installati, jdbc escluso: serve solo a Java).
+     Vedi vendor/oracle-instantclient/README.md. Licenza OTN: la directory
+     e' fuori da git, immagini solo per uso interno.
+   - Target mssql: accesso a packages.microsoft.com (repo RHEL10).
+     ACCEPT_EULA=Y a build-time, immagini solo per uso interno.
+
+2. BUILD
+     ./containers/build.sh mssql
+     ./containers/build.sh oracle
+     ./containers/build.sh all        # mssql + oracle (se ci sono gli RPM)
+
+3. CONFIGURAZIONE
+     mkdir -p config out
+     cp containers/ora2pg.conf.example config/ora2pg.conf
+   Personalizzare UNA sezione: Opzione A (Oracle, dbi:Oracle:...) oppure
+   Opzione B (SQL Server, dbi:ODBC:...). Note:
+   - Salvare config/ora2pg.conf con fine-riga LF (non CRLF).
+   - NON scrivere password nel file: usare le env ORA2PG_USER/ORA2PG_PASSWD
+     oppure i flag -u/-w e --pg_user/--pg_pwd.
+   - Con USER_GRANTS=1 e utente non-DBA aggiungere --no_start_scn.
+
+4. SMOKE TEST SENZA DB VERO (devono fallire solo di connessione)
+     export ORA2PG_USER=test ORA2PG_PASSWD=test   # su Windows: $env:ORA2PG_USER="test" ...
+     podman run --rm -v ./config:/config:ro -v ./out:/work \
+       -e ORA2PG_USER -e ORA2PG_PASSWD \
+       ora2pg:oracle -c /config/ora2pg.conf -t SHOW_VERSION --no_start_scn
+     # atteso nel log out/ora2pg.log: ORA-12545 (host fittizio), mai errori driver
+     podman run --rm -v ./config:/config:ro -v ./out:/work \
+       -e ORA2PG_USER -e ORA2PG_PASSWD \
+       ora2pg:mssql -c /config/ora2pg.conf -t SHOW_VERSION --mssql --no_start_scn
+     # atteso: "Login timeout expired / Server is not found", mai errori driver
+
+   Regole d'oro MSSQL: immagine ora2pg:mssql + flag --mssql SEMPRE + DSN ODBC.
+   "Can't locate DBD/ODBC.pm ... at Ora2Pg/Oracle.pm" = usata l'immagine
+   oracle o dimenticato --mssql. "Aborting export..." da solo non e' l'errore:
+   leggere sempre out/ora2pg.log (montare -v ./out:/work).
+
+5. WORKFLOW REALE (sequenza completa in containers/run-oracle.sh / run-mssql.sh)
+     # 1. export schema
+     podman run --rm -v ./config:/config:ro -v ./out:/work \
+       -e ORA2PG_USER -e ORA2PG_PASSWD \
+       ora2pg:oracle -c /config/ora2pg.conf -t TABLE -b /work --no_start_scn
+     # 2. import schema su PostgreSQL (psql e' gia' nell'immagine;
+     #    pulire a mano eventuali CREATE INDEX indesiderati)
+     podman run --rm --entrypoint psql -v ./out:/work ora2pg:oracle \
+       -h pg-dest -U pgloader -d pdmlink -f /work/ora_export_schema.sql
+     # 3. bulk iniziale: -t COPY --pg_dsn "dbi:Pg:..." (WHERE/DELETE commentati)
+     # 4. incrementale: -t INSERT --pg_dsn "dbi:Pg:..." (WHERE sorgente +
+     #    DELETE destinazione + INSERT_ON_CONFLICT 1, UPSERT custom del fork)
+   Per MSSQL aggiungere --mssql a ogni comando e usare WHERE in dialetto
+   T-SQL (DATEADD) invece di Oracle (SYSDATE).
+
+6. NOTE PIATTAFORMA
+   - Su Windows eseguire dalla root del repo in PowerShell; omettere
+     --userns=keep-id (serve solo su Linux per i permessi su ./out).
+   - DB sul proprio PC: nel DSN usare host.containers.internal, non localhost.
+   - Solo linux/amd64 (Instant Client 19 e msodbcsql18 esistono solo x64).

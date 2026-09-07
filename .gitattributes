@@ -1,0 +1,9 @@
+# Forza LF su file usati dai container Linux (shebang sh, config ora2pg):
+# con autocrlf su Windows un CRLF romperebbe script e DSN.
+.gitattributes text eol=lf
+containers/*.sh text eol=lf
+containers/Containerfile text eol=lf
+containers/mssql/odbcinst.ini text eol=lf
+containers/ora2pg.conf.example text eol=lf
+INSTALL text eol=lf
+.containerignore text eol=lf

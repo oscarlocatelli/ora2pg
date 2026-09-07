@@ -1,0 +1,193 @@
+# Containerfile — ora2pg su UBI10 (Podman, solo linux/amd64)
+#
+# Build (dalla root del repo, NON da containers/):
+#   podman build --platform linux/amd64 -f containers/Containerfile \
+#     --target oracle -t ora2pg:oracle .
+#   podman build --platform linux/amd64 -f containers/Containerfile \
+#     --target mssql -t ora2pg:mssql .
+# Oppure: ./containers/build.sh [oracle|mssql|all]
+#
+# Solo amd64: Instant Client 19 x64 e msodbcsql18 x64 non esistono per arm64.
+# Licenze: RPM Oracle (OTN) e msodbcsql18 (EULA Microsoft) solo per uso interno,
+# mai committati nel repo (vedi .gitignore) né ridistribuiti come immagini pubbliche.
+#
+# Struttura: stage `build-*` con toolchain completa -> stage finali `oracle` /
+# `mssql` con soli RPM runtime + artefatti copiati. Lo split e' obbligatorio
+# perche' su UBI10 `perl` richiede `perl-devel` e `perl-CPAN` richiede `make`:
+# la toolchain non e' rimovibile a posteriori con microdnf senza rimuovere
+# anche l'interprete (verificato: depsolve fallisce con 7 problemi).
+
+ARG UBI_TAG=10.2
+
+#===============================================================================
+# build-base: toolchain + ora2pg compilato da sorgente + cpanm.
+# Pacchetti verificati su ubi10-minimal (UBI_TAG=10.2):
+# - perl-DBD-Pg e perl-Time-HiRes come RPM -> niente CPAN per questi.
+# - perl-DBD-ODBC assente -> DBD::ODBC via cpanm in build-mssql.
+# - perl-core, postgresql-contrib, postgresql*-devel, curl-minimal,
+#   compat-openssl11 assenti (vedi nota nel vecchio stage unico / git log).
+#===============================================================================
+FROM registry.access.redhat.com/ubi10/ubi-minimal:${UBI_TAG} AS build-base
+
+# Directory di build isolata: senza WORKDIR i COPY finirebbero in / e
+# MakeMaker scansionerebbe tutto il filesystem (anche /sys) fallendo.
+WORKDIR /src
+
+COPY Makefile.PL MANIFEST changelog INSTALL LICENSE README ./
+COPY lib ./lib
+COPY scripts ./scripts
+COPY doc ./doc
+
+RUN microdnf install -y \
+      perl perl-DBI perl-devel perl-Time-HiRes perl-DBD-Pg \
+      gcc make \
+      postgresql libpq-devel \
+      bzip2 gzip ca-certificates curl tar \
+      unixODBC unixODBC-devel \
+      libnsl libaio \
+    && sed -i 's/\r$//' scripts/ora2pg scripts/ora2pg_scanner \
+    && perl Makefile.PL CONFDIR=/etc/ora2pg DOCDIR=/usr/share/doc/ora2pg \
+    && make \
+    && make install \
+    && curl -sL https://cpanmin.us | perl - --notest App::cpanminus \
+    && ora2pg --version \
+    && perl -MDBD::Pg -MTime::HiRes -e 'print "Pg + HiRes ok\n"'
+
+#===============================================================================
+# build-mssql: driver Microsoft ODBC 18 (repo RHEL10) + DBD::ODBC compilato.
+# Il repo rhel/10 contiene solo msodbcsql18 >= 18.6 (prima versione con
+# supporto RHEL10): il pin >= 18.6 e' quindi implicito nella scelta del repo.
+# ACCEPT_EULA=Y e' richiesto da Microsoft (immagini solo per uso interno).
+# NOTA: microdnf non installa RPM locali per path -> repo RPM via rpm -Uvh.
+#===============================================================================
+FROM build-base AS build-mssql
+
+COPY containers/mssql/odbcinst.ini /etc/odbcinst.ini
+
+RUN curl -sSL -o /tmp/packages-microsoft-prod.rpm \
+      https://packages.microsoft.com/config/rhel/10/packages-microsoft-prod.rpm \
+    && rpm -Uvh /tmp/packages-microsoft-prod.rpm \
+    && rm -f /tmp/packages-microsoft-prod.rpm \
+    && ACCEPT_EULA=Y microdnf install -y msodbcsql18 \
+    && DRV=$(ls /opt/microsoft/msodbcsql18/lib64/libmsodbcsql-18.*.so.* 2>/dev/null | sort -V | tail -n1) \
+    && test -n "$DRV" \
+    && sed -i "s|^Driver.*|Driver = ${DRV}|" /etc/odbcinst.ini \
+    && odbcinst -q -d | grep -q msodbcsql18 \
+    && cpanm --notest DBD::ODBC \
+    && perl -MDBD::ODBC -MDBD::Pg -e 'print "DBD::ODBC + DBD::Pg ok\n"' \
+    && rm -rf /root/.cpanm /root/.cpan
+
+#===============================================================================
+# build-oracle: Instant Client 19.27 el9 (RPM utente) + DBD::Oracle compilato.
+# RPM in vendor/oracle-instantclient/ (basic+devel+sqlplus; -jdbc- escluso perche'
+# serve solo a Java, non a DBD::Oracle/sqlplus).
+#===============================================================================
+FROM build-base AS build-oracle
+
+ARG ORACLE_HOME=/usr/lib/oracle/19.27/client64
+
+COPY vendor/oracle-instantclient/*.rpm /tmp/oracle/
+
+RUN ls /tmp/oracle/*.rpm \
+    && rpm -Uvh $(ls /tmp/oracle/*.rpm | grep -v -- '-jdbc-') \
+    && rm -rf /tmp/oracle \
+    && ldconfig \
+    && ls "${ORACLE_HOME}/lib/libclntsh.so"* \
+    && if ldd "${ORACLE_HOME}"/lib/libclntsh.so* 2>/dev/null | grep -q "not found"; then \
+         echo "ERRORE: librerie mancanti per libclntsh (rischio noto el9-su-el10):"; \
+         ldd "${ORACLE_HOME}"/lib/libclntsh.so* 2>/dev/null | grep "not found"; \
+         exit 1; \
+       fi \
+    && export ORACLE_HOME="${ORACLE_HOME}" LD_LIBRARY_PATH="${ORACLE_HOME}/lib" \
+    && cpanm --notest DBD::Oracle \
+    && perl -MDBD::Oracle -e 'print "DBD::Oracle $DBD::Oracle::VERSION ok\n"' \
+    && rm -rf /root/.cpanm /root/.cpan
+
+#===============================================================================
+# mssql (finale, snella): soli runtime + artefatti dal builder.
+#===============================================================================
+FROM registry.access.redhat.com/ubi10/ubi-minimal:${UBI_TAG} AS mssql
+
+COPY containers/mssql/odbcinst.ini /etc/odbcinst.ini
+
+# NOTA: `perl-interpreter` e non il metapacchetto `perl`, che su UBI10 richiede
+# perl-devel -> gcc -> l'intera toolchain (+109 MB di solo gcc). I moduli core
+# usati da ora2pg (mappati via rpm -qf sul builder) vanno elencati espliciti.
+RUN microdnf install -y \
+      shadow-utils \
+      perl-interpreter perl-DBI perl-Time-HiRes perl-DBD-Pg \
+      perl-Benchmark perl-Carp perl-Encode perl-Fcntl perl-File-Basename \
+      perl-PathTools perl-File-Temp perl-Getopt-Long perl-IO perl-POSIX \
+      perl-constant perl-vars perl-open \
+      postgresql \
+      bzip2 gzip ca-certificates curl \
+      unixODBC \
+      libnsl libaio \
+    && curl -sSL -o /tmp/packages-microsoft-prod.rpm \
+      https://packages.microsoft.com/config/rhel/10/packages-microsoft-prod.rpm \
+    && rpm -Uvh /tmp/packages-microsoft-prod.rpm \
+    && rm -f /tmp/packages-microsoft-prod.rpm \
+    && ACCEPT_EULA=Y microdnf install -y msodbcsql18 \
+    && DRV=$(ls /opt/microsoft/msodbcsql18/lib64/libmsodbcsql-18.*.so.* 2>/dev/null | sort -V | tail -n1) \
+    && test -n "$DRV" \
+    && sed -i "s|^Driver.*|Driver = ${DRV}|" /etc/odbcinst.ini \
+    && microdnf clean all \
+    && rm -rf /var/cache/dnf /var/cache/yum /tmp/* /var/tmp/*
+
+COPY --from=build-mssql /usr/local /usr/local
+COPY --from=build-mssql /etc/ora2pg /etc/ora2pg
+
+RUN useradd -m -s /bin/bash ora2pg && mkdir -p /work /config && chown ora2pg:ora2pg /work \
+    && odbcinst -q -d | grep -q msodbcsql18 \
+    && ora2pg --version \
+    && perl -MDBD::ODBC -MDBD::Pg -e 'print "DBD::ODBC + DBD::Pg ok\n"'
+
+USER ora2pg
+WORKDIR /work
+ENTRYPOINT ["ora2pg"]
+CMD ["--help"]
+
+#===============================================================================
+# oracle (finale, snella): soli runtime + Instant Client e moduli dal builder.
+#===============================================================================
+FROM registry.access.redhat.com/ubi10/ubi-minimal:${UBI_TAG} AS oracle
+
+ARG ORACLE_HOME=/usr/lib/oracle/19.27/client64
+
+# Come sopra: perl-interpreter evita la catena perl -> perl-devel -> toolchain.
+RUN microdnf install -y \
+      shadow-utils \
+      perl-interpreter perl-DBI perl-Time-HiRes perl-DBD-Pg \
+      perl-Benchmark perl-Carp perl-Encode perl-Fcntl perl-File-Basename \
+      perl-PathTools perl-File-Temp perl-Getopt-Long perl-IO perl-POSIX \
+      perl-constant perl-vars perl-open \
+      postgresql \
+      bzip2 gzip ca-certificates curl \
+      unixODBC \
+      libnsl libaio \
+    && microdnf clean all \
+    && rm -rf /var/cache/dnf /var/cache/yum /tmp/* /var/tmp/*
+
+COPY --from=build-oracle /usr/local /usr/local
+COPY --from=build-oracle /etc/ora2pg /etc/ora2pg
+COPY --from=build-oracle /usr/lib/oracle /usr/lib/oracle
+
+ENV ORACLE_HOME=${ORACLE_HOME} \
+    LD_LIBRARY_PATH=${ORACLE_HOME}/lib \
+    PATH=${ORACLE_HOME}/bin:${PATH} \
+    TNS_ADMIN=/config \
+    NLS_LANG=AMERICAN_AMERICA.AL32UTF8
+
+RUN useradd -m -s /bin/bash ora2pg && mkdir -p /work /config && chown ora2pg:ora2pg /work \
+    && ldconfig \
+    && if ldd "${ORACLE_HOME}"/lib/libclntsh.so* 2>/dev/null | grep -q "not found"; then \
+         ldd "${ORACLE_HOME}"/lib/libclntsh.so* 2>/dev/null | grep "not found"; \
+         exit 1; \
+       fi \
+    && ora2pg --version \
+    && perl -MDBD::Oracle -MDBD::Pg -e 'print "DBD::Oracle + DBD::Pg ok\n"'
+
+USER ora2pg
+WORKDIR /work
+ENTRYPOINT ["ora2pg"]
+CMD ["--help"]

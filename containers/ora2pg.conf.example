@@ -1,0 +1,90 @@
+############################################################################
+# ora2pg.conf.example — container Podman (oracle | mssql)
+#
+# Copiare in ./config/ora2pg.conf e personalizzare. Esempio anonimizzato
+# derivato dal workflow reale: export schema Windchill/PDMLINK, bulk COPY
+# iniziale + incrementale INSERT con UPSERT custom del fork.
+#
+# Uso:
+#   Oracle: podman run ... ora2pg:oracle -c /config/ora2pg.conf -t TABLE ...
+#   MSSQL:  podman run ... ora2pg:mssql  -c /config/ora2pg.conf -t TABLE --mssql ...
+#
+# Credenziali: NON scrivere password qui se l'immagine/log vengono condivisi.
+# Lasciare ORACLE_PWD / PG_PWD commentati e passare:
+#   -e ORA2PG_USER=... -e ORA2PG_PASSWD=...
+# oppure i flag CLI -u / -w e --pg_user / --pg_pwd.
+############################################################################
+
+#------------------------------------------------------------------------------
+# CONNESSIONE SORGENTE — scegliere UNA delle due sezioni
+#------------------------------------------------------------------------------
+
+# --- Opzione A: Oracle ---
+ORACLE_HOME	/usr/lib/oracle/19.27/client64
+ORACLE_DSN	dbi:Oracle:host=oracle-src.example;sid=WIND;port=1521
+ORACLE_USER	pdmlink_reader
+#ORACLE_PWD	changeme
+
+# --- Opzione B: SQL Server via ODBC (richiede flag CLI --mssql) ---
+#ORACLE_DSN	dbi:ODBC:Driver={ODBC Driver 18 for SQL Server};Server=mssql-src.example,1433;Database=pdmlink;TrustServerCertificate=yes
+#ORACLE_USER	pdmlink_reader
+#ORACLE_PWD	changeme
+
+# Utente senza privilegi DBA: legge da ALL_* invece di DBA_*.
+# In questo caso avviare ora2pg con --no_start_scn (evita SELECT su v$database).
+USER_GRANTS	1
+
+SCHEMA	PDMLINK
+
+# Lista tabelle Windchill di esempio — sostituire con le proprie.
+# Separatore: spazio. Supporta regex (LIKE).
+ALLOW	WTUSER WTPART WTPARTMASTER WTOPTION WTORGANIZATION WTDOCUMENT WTEPMPART
+
+#------------------------------------------------------------------------------
+# DESTINAZIONE POSTGRESQL (solo per import diretto COPY/INSERT con --pg_dsn)
+# Per export su file lasciare commentato e usare -o /work/output.sql
+#------------------------------------------------------------------------------
+#PG_DSN		dbi:Pg:dbname=pdmlink;host=pg-dest.example;port=5432
+#PG_USER	pgloader
+#PG_PWD		changeme
+PG_VERSION	11
+
+#------------------------------------------------------------------------------
+# OUTPUT
+#------------------------------------------------------------------------------
+OUTPUT		/work/output.sql
+OUTPUT_DIR	/work
+
+DEBUG	0
+LOGFILE		/work/ora2pg.log
+
+CLIENT_ENCODING	UTF8
+CREATE_SCHEMA	1
+EXPORT_SCHEMA	0
+
+# Tipi numerici senza precisione (Oracle NUMBER -> PG numeric).
+# La guida del fork usa `numeric` invece del default `bigint`.
+DEFAULT_NUMERIC	numeric
+
+# UPSERT del fork su chiave idA2A2 / updateStampA2 (NON e' upstream standard).
+# Agisce solo su export INSERT con import diretto (--pg_dsn).
+# Per bulk iniziale COPY lasciare gestito via WHERE/DELETE sotto.
+INSERT_ON_CONFLICT	1
+
+#------------------------------------------------------------------------------
+# ESTRAZIONE DATI: bulk iniziale (COPY) vs incrementale (INSERT)
+# Sequenza reale: TABLE -o -> psql -f schema -> COPY bulk -> INSERT incrementale
+#------------------------------------------------------------------------------
+
+# --- Bulk iniziale: TUTTE le righe, nessuna WHERE/DELETE ---
+# Lasciare WHERE e DELETE commentati per il primo caricamento:
+#WHERE
+#DELETE
+
+# --- Incrementale (ultime 3 ore): decommentare per export INSERT ---
+# Dialetto Oracle:
+#WHERE	updateStampA2 > SYSDATE-(3/24)
+# Dialetto MSSQL (stessa finestra, sintassi T-SQL):
+#WHERE	updateStampA2 > DATEADD(HOUR,-3,GETDATE())
+# Pulizia lato PG prima del reload (stessa finestra, sintassi PostgreSQL):
+#DELETE	TABLE_TEST[updatestampa2 > NOW() - INTERVAL '3 hours']
