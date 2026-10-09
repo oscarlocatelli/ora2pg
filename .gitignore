@@ -1,10 +1,4 @@
 # --- ora2pg container (licenze + segreti locali, mai committare) ---
-# Instant Client Oracle (licenza OTN): l'intera directory resta fuori da git.
-# Le immagini buildate con questi RPM sono solo per uso interno.
-vendor/oracle-instantclient/
-# Altri eventuali archivi driver locali
-*.rpm
-*.zip
 
 # Config locali (possono contenere password) e output di export
 config/
