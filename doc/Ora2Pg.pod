@@ -1850,6 +1850,48 @@ value of this directive by dividing it by 10 until his value is below 1000.
 You can control this value by setting BLOB_LIMIT. Exporting BLOB use lot of
 resources, setting it to a too high value can produce OOM.
 
+=item SOURCE_PAGE_SIZE
+
+Keyset pagination of source queries in the single-process direct-PG
+COPY/INSERT path that already supports in-memory resume. Each page is an
+ordered query limited to SOURCE_PAGE_SIZE rows from the last confirmed
+checkpoint (Oracle ORDER BY source PK FETCH FIRST N ROWS ONLY, MSSQL
+SELECT TOP (N) ... ORDER BY source PK with a source PK > ? placeholder,
+raw values, no interpolation, no OFFSET, no MAX(id) on PostgreSQL).
+Default 100000. Set to 0 to disable pagination and keep the previous
+single-cursor retry/resume path, query, isolation and behavior unchanged.
+Negative, fractional, empty or non-numeric values fail during initial
+validation.
+
+DATA_LIMIT and BLOB_LIMIT stay independent PG buffer/writer sizes: a page
+may contain many PG blocks and memory stays bounded by those buffers,
+never by the page. Smaller pages shorten the source snapshot lifetime but
+increase SQL executions.
+
+Scope: Oracle and MSSQL, COPY/INSERT direct import (PG_DSN set), single
+process (JOBS, ORACLE_COPIES and PARALLEL_TABLES all 1), single
+exact-numeric source primary key in the projection. Other modes keep the
+ordinary export. Oracle needs a recognized server version >= 12c (the
+real 19c case); older or unknown versions keep the non-paginated resume
+with a logged reason. Tables with TRANSFORM_VALUE on a non-PK column keep
+the non-paginated resume with a logged reason; a transformed PK stays
+non-resumable as before.
+
+Each page renews only the source transaction (Oracle rollback, begin_work
+and reapplied isolation as the first SQL; MSSQL normally AutoCommit keeps
+session isolation) on the same healthy connection. No periodic
+reconnection, no wait between healthy pages, no PG transaction change, no
+ORA_INITIAL_COMMAND replay per page. Commands in ORA_INITIAL_COMMAND with
+transactional state depending on a single transaction require
+SOURCE_PAGE_SIZE=0. Consistency is best-effort: snapshots differ between
+pages, updates/deletes or inserts with an already-passed PK are not
+realigned, there is no persistent checkpoint, no OFFSET and no assumption
+of consecutive PKs. Source connection losses still retry forever with a
+60s wait and resume from pk > checkpoint with a fresh full-size page;
+ORA-01555 stays FATAL. An explicit or automatic flashback (AS OF
+SCN/TIMESTAMP) stays in every page template: pagination does not renew
+the flashback snapshot, so undo risk is not removed.
+
 =item CLOB_AS_BLOB
 
 Apply same behavior on CLOB than BLOB with BLOB_LIMIT settings. This is

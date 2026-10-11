@@ -945,6 +945,16 @@ DATA_LIMIT	$DATA_LIMIT_DEFAULT
 # ressources, setting it to a too high value can produce OOM.
 #BLOB_LIMIT	500
 
+# Keyset pagination of source queries in the single-process direct-PG
+# COPY/INSERT path (Oracle/MSSQL, single exact-numeric PK). Each page is an
+# ordered query limited to N rows from the last confirmed checkpoint.
+# Oracle uses FETCH FIRST N ROWS ONLY (>=12c), MSSQL uses SELECT TOP (N).
+# Default 100000. 0 disables pagination and keeps the single-cursor path.
+# DATA_LIMIT/BLOB_LIMIT stay independent PG buffer sizes. Each page renews
+# only the source transaction (best-effort snapshots); ORA-01555 stays
+# FATAL; ORA_INITIAL_COMMAND with single-transaction state needs 0.
+#SOURCE_PAGE_SIZE	100000
+
 # Apply same behavior on CLOB than BLOB with BLOB_LIMIT settings. This is
 # especially useful if you have large CLOB data.
 CLOB_AS_BLOB	1

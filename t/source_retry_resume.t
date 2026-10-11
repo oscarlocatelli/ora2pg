@@ -992,4 +992,714 @@ sub make_obj {
 	ok(!exists $o->{_src_resume}{ORD}, 'no resume for ordinary table');
 }
 
+# --- 21. SOURCE_PAGE_SIZE _init defaults and validation ---
+{
+	# Direct helper used by _init (avoids DB connection in unit tests).
+	# Missing => default 100000, explicit 0 preserved, no ||=.
+	my $tmp = make_obj();
+	is($tmp->_validate_source_page_size(undef, 1), 100000, 'default SOURCE_PAGE_SIZE 100000 when missing');
+	is($tmp->_validate_source_page_size(0, 0), 0, 'explicit 0 preserved');
+	is($tmp->_validate_source_page_size('0', 0), 0, 'explicit string 0 preserved');
+	is($tmp->_validate_source_page_size(5, 0), 5, 'custom page size 5');
+	is($tmp->_validate_source_page_size('  42  ', 0), 42, 'whitespace trimmed');
+	foreach my $bad ('-1', '10.5', 'abc', '', ' ', '1e3', '5,000', undef) {
+		my $o2 = make_obj();
+		# logit FATAL dies with Aborting...; capture die (message printed, $@ is Aborting)
+		my $died = '';
+		{
+			# Suppress STDOUT print from logit FATAL during expected failures
+			my $out = '';
+			open(my $fh, '>', \$out);
+			my $old = select($fh);
+			eval { $o2->_validate_source_page_size($bad, 0); 1; } or $died = $@;
+			select($old);
+			close($fh);
+		}
+		ok($died ne '', "invalid SOURCE_PAGE_SIZE '" . (defined $bad ? $bad : 'undef') . "' dies");
+	}
+	# _src_page_size helper defaults for bless-bypassed objects
+	my $b = make_obj();
+	delete $b->{source_page_size};
+	is($b->_src_page_size(), 100000, '_src_page_size defaults without _init');
+	$b->{source_page_size} = 0;
+	is($b->_src_page_size(), 0, '_src_page_size preserves 0');
+	# _init path preserves 0 (no ||=): simulate copy from AConfig
+	my $init_like = make_obj(source_page_size => 0);
+	# Emulate _init assignment line
+	$init_like->{source_page_size} = $init_like->_validate_source_page_size($init_like->{source_page_size}, 0);
+	is($init_like->{source_page_size}, 0, '_init preserves explicit 0');
+}
+
+# --- 22. Oracle version support for FETCH FIRST ---
+{
+	my $o = make_obj();
+	$o->{db_version} = 'Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production';
+	ok($o->_src_oracle_supports_pages(), '19c supports pages');
+	$o->{db_version} = 'Oracle Database 12c Enterprise Edition Release 12.1.0.2.0';
+	ok($o->_src_oracle_supports_pages(), '12c supports pages');
+	$o->{db_version} = 'Oracle Database 21c Enterprise Edition Release 21.0.0.0.0';
+	ok($o->_src_oracle_supports_pages(), '21c supports pages');
+	$o->{db_version} = 'Oracle Database 11g Enterprise Edition Release 11.2.0.4.0';
+	ok(!$o->_src_oracle_supports_pages(), '11g no pages');
+	$o->{db_version} = 'Oracle Database 10g Release 10.2.0.5.0';
+	ok(!$o->_src_oracle_supports_pages(), '10g no pages');
+	$o->{db_version} = '';
+	ok(!$o->_src_oracle_supports_pages(), 'empty version no pages');
+	delete $o->{db_version};
+	ok(!$o->_src_oracle_supports_pages(), 'undef version no pages');
+	$o->{db_version} = '19.0.0.0.0';
+	ok($o->_src_oracle_supports_pages(), 'dotted 19 supports pages');
+	$o->{db_version} = '11.2.0.4.0';
+	ok(!$o->_src_oracle_supports_pages(), 'dotted 11 no pages');
+}
+
+# --- 23. Paged SQL: Oracle >=12c, WHERE variants, quoting, no OFFSET ---
+{
+	sub make_paged_oracle_obj {
+		my (%a) = @_;
+		my $o = make_obj(
+			source_page_size => 5,
+			db_version => 'Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production',
+			transaction => 'SET TRANSACTION ISOLATION LEVEL SERIALIZABLE',
+			%a,
+		);
+		$o->{tables}{QT}{unique_key} = { PK1 => { type => 'P', columns => ['ID'] } };
+		$o->{tables}{QT}{column_info} = {
+			ID => ['ID', 'NUMBER', 22, 'N', undef, undef, undef, undef, 'QT', '', 'NO', 1],
+			NAME => ['NAME', 'VARCHAR2', 10, 'Y', undef, undef, undef, undef, 'QT', '', 'NO', 2],
+		};
+		$o->{tables}{QT}{table_info} = { nested => 'NO', owner => 'SC', num_rows => 10 };
+		$o->{colinfo} = { QT => { ID => { nullable => 'N' }, NAME => { nullable => 'Y' } } };
+		$o->{prefix} = 'DBA';
+		$o->{data_type} = { NUMBER => 'numeric', VARCHAR2 => 'varchar' };
+		$o->{user_type} = {};
+		$o->{spatial_srid} = {};
+		$o->{nullable} = {};
+		$o->{local_data_limit} = {};
+		$o->{bfile_found} = '';
+		$o->{has_dbms_log_execute_privilege} = 0;
+		$o->{empty_lob_null} = 0;
+		$o->{enable_blob_export} = 1;
+		$o->{enable_clob_export} = 1;
+		$o->{trim_type} = 'BOTH';
+		$o->{trim_char} = ' ';
+		$o->{geometry_extract_type} = 'WKT';
+		return $o;
+	}
+	my $o = make_paged_oracle_obj();
+	my $q = $o->_howto_get_data('QT', ['ID', 'NAME'], ['bigint', 'varchar'], ['NUMBER', 'VARCHAR2'], undef, undef);
+	like($q, qr/ORDER BY a\."ID" FETCH FIRST 5 ROWS ONLY/, 'oracle paged initial has FETCH FIRST 5');
+	unlike($q, qr/OFFSET/i, 'no OFFSET in paged query');
+	ok($o->{_src_resume}{QT}{paged}, 'paged flag stored');
+	is($o->{_src_resume}{QT}{page_size}, 5, 'page size stored');
+	my $rsql = $o->_src_resume_sql('QT');
+	like($rsql, qr/WHERE a\."ID" > \? ORDER BY a\."ID" FETCH FIRST 5 ROWS ONLY/, 'oracle paged resume with placeholder and limit');
+	unlike($rsql, qr/123|999/, 'no ID interpolated in paged resume');
+
+	# WHERE present -> AND
+	$o = make_paged_oracle_obj();
+	$o->{where} = { qt => "NAME = 'x'" };
+	$q = $o->_howto_get_data('QT', ['ID', 'NAME'], ['bigint', 'varchar'], ['NUMBER', 'VARCHAR2'], undef, undef);
+	like($q, qr/WHERE \(NAME = 'x'\) ORDER BY.*FETCH FIRST 5/, 'where preserved with paged limit');
+	$rsql = $o->_src_resume_sql('QT');
+	like($rsql, qr/\(NAME = 'x'\) AND a\."ID" > \?/, 'resume AND after filter with paging');
+
+	# OR filter
+	$o = make_paged_oracle_obj();
+	$o->{where} = { qt => "NAME = 'x' OR NAME = 'y'" };
+	$q = $o->_howto_get_data('QT', ['ID', 'NAME'], ['bigint', 'varchar'], ['NUMBER', 'VARCHAR2'], undef, undef);
+	like($q, qr/\(NAME = 'x' OR NAME = 'y'\)/, 'OR filter parenthesized with paging');
+	$rsql = $o->_src_resume_sql('QT');
+	like($rsql, qr/\) AND a\."ID" > \?/, 'OR + resume AND correct with paging');
+
+	# Rename dest must not affect source ORDER BY
+	$o = make_paged_oracle_obj();
+	$o->{replaced_cols} = { qt => { id => 'ID_NEW' } };
+	$q = $o->_howto_get_data('QT', ['ID', 'NAME'], ['bigint', 'varchar'], ['NUMBER', 'VARCHAR2'], undef, undef);
+	like($q, qr/ORDER BY a\."ID"/, 'paged order uses source column despite rename');
+
+	# MSSQL TOP
+	my $m = make_obj(is_mssql => 1, sgbd_name => 'MSSQL', source_page_size => 5, db_version => 'Microsoft SQL Server 2019');
+	$m->{tables}{QT}{unique_key} = { PK1 => { type => 'P', columns => ['ID'] } };
+	$m->{tables}{QT}{column_info} = { ID => ['ID', 'int', 4, 'N', undef, undef, undef, undef, 'QT', '', 'NO', 1] };
+	$m->{tables}{QT}{table_info} = { nested => 'NO', num_rows => 10 };
+	$m->{colinfo} = { QT => { ID => { nullable => 'N' } } };
+	$m->{prefix} = 'DBA';
+	$m->{data_type} = { int => 'integer' };
+	$m->{user_type} = {};
+	$m->{spatial_srid} = {};
+	$m->{nullable} = {};
+	$m->{local_data_limit} = {};
+	$m->{bfile_found} = '';
+	$m->{has_dbms_log_execute_privilege} = 0;
+	$m->{empty_lob_null} = 0;
+	$m->{enable_blob_export} = 1;
+	$m->{enable_clob_export} = 1;
+	$m->{trim_type} = 'BOTH';
+	$m->{trim_char} = ' ';
+	$m->{geometry_extract_type} = 'WKT';
+	my $mq = $m->_howto_get_data('QT', ['ID'], ['integer'], ['int'], undef, undef);
+	like($mq, qr/^SELECT TOP \(5\)/i, 'mssql paged initial has TOP (5)');
+	like($mq, qr/ORDER BY a\.\[ID\]/, 'mssql paged order');
+	unlike($mq, qr/OFFSET/i, 'mssql no OFFSET');
+	my $mrsql = $m->_src_resume_sql('QT');
+	like($mrsql, qr/TOP \(5\).*WHERE a\.\[ID\] > \? ORDER BY/, 'mssql paged resume with TOP and placeholder');
+
+	# Old version fallback keeps resume without limit
+	my $old = make_paged_oracle_obj(db_version => 'Oracle Database 11g Enterprise Edition Release 11.2.0.4.0');
+	$q = $old->_howto_get_data('QT', ['ID', 'NAME'], ['bigint', 'varchar'], ['NUMBER', 'VARCHAR2'], undef, undef);
+	unlike($q, qr/FETCH FIRST/i, '11g fallback has no FETCH FIRST');
+	like($q, qr/ORDER BY a\."ID"/, '11g fallback still ordered');
+	ok(!$old->{_src_resume}{QT}{paged}, '11g paged flag off');
+	$rsql = $old->_src_resume_sql('QT');
+	unlike($rsql, qr/FETCH FIRST/i, '11g resume no limit');
+
+	# Unknown version fallback
+	my $unk = make_paged_oracle_obj();
+	delete $unk->{db_version};
+	$q = $unk->_howto_get_data('QT', ['ID', 'NAME'], ['bigint', 'varchar'], ['NUMBER', 'VARCHAR2'], undef, undef);
+	unlike($q, qr/FETCH FIRST/i, 'unknown version fallback no limit');
+	ok(!$unk->{_src_resume}{QT}{paged}, 'unknown version paged off');
+
+	# TRANSFORM_VALUE non-PK fallback keeps resume
+	my $tr = make_paged_oracle_obj();
+	$tr->{transform_value} = { qt => { name => 'UPPER(NAME)' } };
+	$q = $tr->_howto_get_data('QT', ['ID', 'NAME'], ['bigint', 'varchar'], ['NUMBER', 'VARCHAR2'], undef, undef);
+	unlike($q, qr/FETCH FIRST/i, 'transform non-PK fallback no limit');
+	like($q, qr/ORDER BY a\."ID"/, 'transform non-PK still resumable ordered');
+	ok(!$tr->{_src_resume}{QT}{paged}, 'transform non-PK paged off');
+
+	# SOURCE_PAGE_SIZE=0 preserves old path
+	my $zero = make_paged_oracle_obj(source_page_size => 0);
+	$q = $zero->_howto_get_data('QT', ['ID', 'NAME'], ['bigint', 'varchar'], ['NUMBER', 'VARCHAR2'], undef, undef);
+	unlike($q, qr/FETCH FIRST/i, 'page_size 0 no limit');
+	ok(!$zero->{_src_resume}{QT}{paged}, 'page_size 0 paged off');
+}
+
+# --- 24. Oracle paged projections have unique aliases ---
+{
+	my $o = make_obj(
+		source_page_size => 5,
+		db_version => 'Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production',
+		transaction => 'SET TRANSACTION ISOLATION LEVEL SERIALIZABLE',
+	);
+	$o->{tables}{AT}{unique_key} = { PK1 => { type => 'P', columns => ['ID'] } };
+	$o->{tables}{AT}{column_info} = {
+		ID => ['ID', 'NUMBER', 22, 'N', undef, undef, undef, undef, 'AT', '', 'NO', 1],
+		DATA => ['DATA', 'CLOB', 4000, 'Y', undef, undef, undef, undef, 'AT', '', 'NO', 2],
+		XD => ['XD', 'XMLTYPE', 4000, 'Y', undef, undef, undef, undef, 'AT', '', 'NO', 3],
+	};
+	$o->{tables}{AT}{table_info} = { nested => 'NO', owner => 'SC', num_rows => 5 };
+	$o->{colinfo} = { AT => { ID => { nullable => 'N' }, DATA => { nullable => 'Y' }, XD => { nullable => 'Y' } } };
+	$o->{prefix} = 'DBA';
+	$o->{data_type} = { NUMBER => 'numeric', CLOB => 'text', XMLTYPE => 'xml' };
+	$o->{user_type} = {};
+	$o->{spatial_srid} = {};
+	$o->{nullable} = {};
+	$o->{local_data_limit} = {};
+	$o->{bfile_found} = '';
+	$o->{has_dbms_log_execute_privilege} = 0;
+	$o->{empty_lob_null} = 0;
+	$o->{enable_blob_export} = 1;
+	$o->{enable_clob_export} = 1;
+	$o->{trim_type} = 'BOTH';
+	$o->{trim_char} = ' ';
+	$o->{geometry_extract_type} = 'WKT';
+	$o->{xml_pretty} = 0;
+	my $q = $o->_howto_get_data('AT', ['ID', 'DATA', 'XD'], ['bigint', 'text', 'xml'], ['NUMBER', 'CLOB', 'XMLTYPE'], undef, undef);
+	like($q, qr/a\."ID" AS "ID"/, 'plain column aliased when paged');
+	like($q, qr/a\."DATA" AS "DATA"/, 'clob plain aliased when paged');
+	like($q, qr/getClobVal\(\) AS "XD"/, 'xmltype aliased when paged');
+	like($q, qr/FETCH FIRST 5 ROWS ONLY/, 'paged limit present with aliases');
+
+	# Non-paged has no extra aliases (except trim)
+	my $n = make_obj(source_page_size => 0, db_version => 'Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production');
+	$n->{tables}{AT}{unique_key} = { PK1 => { type => 'P', columns => ['ID'] } };
+	$n->{tables}{AT}{column_info} = $o->{tables}{AT}{column_info};
+	$n->{tables}{AT}{table_info} = { nested => 'NO', owner => 'SC', num_rows => 5 };
+	$n->{colinfo} = $o->{colinfo};
+	$n->{prefix} = 'DBA';
+	$n->{data_type} = $o->{data_type};
+	$n->{user_type} = {};
+	$n->{spatial_srid} = {};
+	$n->{nullable} = {};
+	$n->{local_data_limit} = {};
+	$n->{bfile_found} = '';
+	$n->{has_dbms_log_execute_privilege} = 0;
+	$n->{empty_lob_null} = 0;
+	$n->{enable_blob_export} = 1;
+	$n->{enable_clob_export} = 1;
+	$n->{trim_type} = 'BOTH';
+	$n->{trim_char} = ' ';
+	$n->{geometry_extract_type} = 'WKT';
+	$n->{xml_pretty} = 0;
+	my $nq = $n->_howto_get_data('AT', ['ID', 'DATA', 'XD'], ['bigint', 'text', 'xml'], ['NUMBER', 'CLOB', 'XMLTYPE'], undef, undef);
+	unlike($nq, qr/a\."ID" AS "ID"/, 'non-paged plain has no alias');
+}
+
+# --- 25. Paged bulk happy paths with SQL-aware fakes ---
+{
+	package FakePagedSTH2;
+	sub new {
+		my ($class, $dataset, $page_size, %o) = @_;
+		return bless {
+			dataset => [@$dataset],
+			page_size => $page_size,
+			page_rows => [],
+			fetch_pos => 0,
+			calls => 0,
+			fetch_ns => [],
+			max_page_seen => 0,
+			fail_at => $o{fail_at},
+			fail_err => $o{fail_err},
+			fail_errstr => $o{fail_errstr} || '',
+			fail_state => $o{fail_state} || '',
+			die_on_fetch => $o{die_on_fetch} || 0,
+			err => undef, errstr => '', state => '',
+			finished => 0,
+		}, $class;
+	}
+	sub execute {
+		my ($self, @bind) = @_;
+		$self->{bind} = [@bind];
+		my $cp = @bind ? $bind[0] : undef;
+		my @f;
+		foreach my $id (@{$self->{dataset}}) {
+			if (!defined $cp) { push @f, $id; }
+			else { push @f, $id if (0+$id > 0+$cp); }
+		}
+		splice(@f, $self->{page_size}) if (@f > $self->{page_size});
+		$self->{max_page_seen} = @f if (@f > $self->{max_page_seen});
+		$self->{page_rows} = [map { [$_] } @f];
+		$self->{fetch_pos} = 0;
+		$self->{calls} = 0;
+		return 1;
+	}
+	sub fetchall_arrayref {
+		my ($self, $u, $limit) = @_;
+		push @{$self->{fetch_ns}}, $limit;
+		my $idx = $self->{calls}++;
+		if (defined $self->{fail_at} && $idx == $self->{fail_at}) {
+			$self->{err} = $self->{fail_err};
+			$self->{errstr} = $self->{fail_errstr};
+			$self->{state} = $self->{fail_state};
+			die $self->{fail_errstr} if ($self->{die_on_fetch});
+			return undef;
+		}
+		$self->{err} = undef; $self->{errstr} = ''; $self->{state} = '';
+		my $rem = @{$self->{page_rows}} - $self->{fetch_pos};
+		return [] if ($rem <= 0);
+		my $n = $limit;
+		$n = $rem if ($rem < $n);
+		my @out;
+		for (my $i = 0; $i < $n; $i++) { push @out, $self->{page_rows}->[$self->{fetch_pos}++]; }
+		return \@out;
+	}
+	sub err { return $_[0]->{err}; }
+	sub errstr { return $_[0]->{errstr}; }
+	sub state { return $_[0]->{state}; }
+	sub finish { $_[0]->{finished} = 1; return 1; }
+
+	package main;
+	# Helper to run paged bulk with dataset, page_size, data_limit
+	sub run_paged_bulk {
+		my (%a) = @_;
+		my $dataset = $a{dataset} || [];
+		my $page_size = $a{page_size} || 5;
+		my $data_limit = exists $a{data_limit} ? $a{data_limit} : 2;
+		my $o = make_obj(
+			source_page_size => $page_size,
+			data_limit => $data_limit,
+			db_version => 'Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production',
+			transaction => 'SET TRANSACTION ISOLATION LEVEL SERIALIZABLE',
+		);
+		$o->{tables}{PT}{unique_key} = { PK1 => { type => 'P', columns => ['ID'] } };
+		$o->{tables}{PT}{column_info} = { ID => ['ID', 'NUMBER', 22, 'N', undef, undef, undef, undef, 'PT', '', 'NO', 1] };
+		$o->{tables}{PT}{table_info} = { num_rows => scalar(@$dataset) };
+		$o->{colinfo} = { PT => { ID => { nullable => 'N' } } };
+		$o->{prefix} = 'DBA';
+		$o->{data_type} = { NUMBER => 'numeric' };
+		$o->{user_type} = {};
+		$o->{spatial_srid} = {};
+		$o->{nullable} = {};
+		$o->{local_data_limit} = {};
+		$o->{bfile_found} = '';
+		$o->{has_dbms_log_execute_privilege} = 0;
+		$o->{empty_lob_null} = 0;
+		$o->{enable_blob_export} = 1;
+		$o->{enable_clob_export} = 1;
+		$o->{trim_type} = 'BOTH';
+		$o->{trim_char} = ' ';
+		$o->{geometry_extract_type} = 'WKT';
+		my @nn = ('ID');
+		my $q = $o->_howto_get_data('PT', [@nn], ['bigint'], ['NUMBER'], undef, undef);
+		my $initial = $q;
+		my @sent;
+		my @sqls;
+		my @binds;
+		my @renew_calls;
+		my $reconnects = 0;
+		my @sths;
+		no warnings 'redefine';
+		local *Ora2Pg::_dump_to_pg = sub {
+			my ($self, $proc, $rows, @rest) = @_;
+			foreach my $r (@$rows) { push @sent, "$r->[0]"; }
+			return 1;
+		};
+		local *Ora2Pg::_src_page_renew_txn = sub {
+			my ($self, $table, $sth) = @_;
+			push @renew_calls, $table;
+			return 1;
+		};
+		local *Ora2Pg::_src_reconnect = sub { $reconnects++; return bless({}, 'FakeDBH2'); };
+		local *Ora2Pg::_src_prepare_source_sth = sub {
+			my ($self, $table, $sql) = @_;
+			push @sqls, $sql;
+			my $sth = FakePagedSTH2->new($dataset, $page_size);
+			push @sths, $sth;
+			return $sth;
+		};
+		# Need execute to capture binds: wrap FakePagedSTH2 execute
+		no warnings 'redefine';
+		my $orig_exec = \&FakePagedSTH2::execute;
+		local *FakePagedSTH2::execute = sub {
+			my ($self, @b) = @_;
+			@binds = (@binds, [@b]) if (@b);
+			# Also record per-STH binds
+			push @{$self->{all_binds}}, [@b];
+			return $orig_exec->($self, @b);
+		};
+		# Actually _extract_paged_bulk calls $sth->execute(@bind) after prepare; our STH execute already handles.
+		# But we need to intercept binds per prepare: easier to record in prepare mock via closure over dataset?
+		# The above local *Execute records globally; keep it.
+		my $total = $o->_extract_resumable_bulk($initial, 'PT', [], [], 'INSERT', ['ID'], ['bigint'], '', ['NUMBER'], undef, undef, {});
+		return { total => $total, sent => [@sent], sqls => [@sqls], sths => [@sths], renews => scalar(@renew_calls), reconnects => $reconnects, obj => $o };
+	}
+
+	my $r = run_paged_bulk(dataset => [1,2,3,4,5,6,7,8,9,10,11,12], page_size => 5, data_limit => 2);
+	is($r->{total}, 12, 'paged bulk 12 rows with 5/2 completes');
+	is_deeply($r->{sent}, [map {"$_"} 1..12], 'paged IDs in order no skip/dup');
+	is(scalar(@{$r->{sqls}}), 3, 'three pages (5,5,2)');
+	foreach my $s (@{$r->{sqls}}) { like($s, qr/FETCH FIRST 5 ROWS ONLY/, 'each page has limit 5'); unlike($s, qr/OFFSET/i, 'no OFFSET'); }
+	# Max N per query: each STH max_page_seen <=5
+	foreach my $sth (@{$r->{sths}}) { ok($sth->{max_page_seen} <= 5, 'max N per query respected'); foreach my $fn (@{$sth->{fetch_ns}}) { ok($fn <= 2, 'fetch bounded by DATA_LIMIT'); } }
+	is($r->{renews}, 3, 'renew before each page (3)');
+	is($r->{reconnects}, 0, 'no reconnect in healthy rollover');
+
+	# Empty, <N, =N, exact multiple
+	$r = run_paged_bulk(dataset => [], page_size => 5, data_limit => 2);
+	is($r->{total}, 0, 'empty table paged 0');
+	is(scalar(@{$r->{sent}}), 0, 'empty no writer');
+
+	$r = run_paged_bulk(dataset => [1,2,3], page_size => 5, data_limit => 2);
+	is($r->{total}, 3, 'short page <N completes');
+	is_deeply($r->{sent}, [qw(1 2 3)], 'short IDs exact');
+
+	$r = run_paged_bulk(dataset => [1,2,3,4,5], page_size => 5, data_limit => 2);
+	is($r->{total}, 5, '=N needs empty final query but completes');
+	is(scalar(@{$r->{sqls}}), 2, '=N does extra empty page (5 + 0)');
+
+	$r = run_paged_bulk(dataset => [1,2,3,4,5,6,7,8,9,10], page_size => 5, data_limit => 2);
+	is($r->{total}, 10, 'exact multiple 10 with 5 needs empty final');
+	is(scalar(@{$r->{sqls}}), 3, 'exact multiple 3 queries (5,5,0)');
+
+	# Page < buffer
+	$r = run_paged_bulk(dataset => [1,2,3,4,5,6], page_size => 2, data_limit => 10);
+	is($r->{total}, 6, 'page < buffer completes');
+	is(scalar(@{$r->{sqls}}), 4, 'page 2 with 6 rows needs 4 queries (2,2,2,0)');
+
+	# Gaps, negatives, zero, decimals
+	$r = run_paged_bulk(dataset => [-5,-2,0,2,5,10,100], page_size => 3, data_limit => 2);
+	is_deeply($r->{sent}, [qw(-5 -2 0 2 5 10 100)], 'negatives/zero/gaps order preserved');
+	for (my $i = 0; $i < @{$r->{sqls}}; $i++) {
+		my $s = $r->{sqls}->[$i];
+		unlike($s, qr/-5|100/, 'no ID interpolated with gaps');
+		if ($i == 0) {
+			unlike($s, qr/> \?/, 'initial page has no PK predicate');
+		} else {
+			like($s, qr/> \?/, 'resume pages use placeholder');
+		}
+	}
+
+	# Big IDs beyond 2^53
+	$r = run_paged_bulk(dataset => ['9007199254740993','9007199254740994','9007199254740995','9007199254740996'], page_size => 2, data_limit => 2);
+	is($r->{total}, 4, 'big IDs paged total');
+	is_deeply($r->{sent}, ['9007199254740993','9007199254740994','9007199254740995','9007199254740996'], 'big IDs exact strings');
+}
+
+# --- 26. Paged bulk failures, PK capture, PG fatal, ORA-01555 ---
+{
+	# Failure before first confirmation restarts from initial (paged first page)
+	{
+		my $dataset = [1,2,3,4];
+		my $o = make_obj(source_page_size => 5, data_limit => 2, db_version => 'Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production', transaction => 'SET TRANSACTION ISOLATION LEVEL SERIALIZABLE');
+		$o->{tables}{FT}{unique_key} = { PK1 => { type => 'P', columns => ['ID'] } };
+		$o->{tables}{FT}{column_info} = { ID => ['ID', 'NUMBER', 22, 'N', undef, undef, undef, undef, 'FT', '', 'NO', 1] };
+		$o->{tables}{FT}{table_info} = { num_rows => 4 };
+		$o->{colinfo} = { FT => { ID => { nullable => 'N' } } };
+		$o->{prefix} = 'DBA'; $o->{data_type} = { NUMBER => 'numeric' }; $o->{user_type} = {}; $o->{spatial_srid} = {}; $o->{nullable} = {}; $o->{local_data_limit} = {}; $o->{bfile_found} = ''; $o->{has_dbms_log_execute_privilege} = 0; $o->{empty_lob_null} = 0; $o->{enable_blob_export} = 1; $o->{enable_clob_export} = 1; $o->{trim_type} = 'BOTH'; $o->{trim_char} = ' '; $o->{geometry_extract_type} = 'WKT';
+		my $q = $o->_howto_get_data('FT', ['ID'], ['bigint'], ['NUMBER'], undef, undef);
+		my @sent; my @sqls; my $rc = 0;
+		no warnings 'redefine';
+		local *Ora2Pg::_dump_to_pg = sub { my ($self,$proc,$rows,@r)=@_; foreach my $rr (@$rows){push @sent,"$rr->[0]";} return 1; };
+		local *Ora2Pg::_src_page_renew_txn = sub { return 1; };
+		local *Ora2Pg::_src_reconnect = sub { $rc++; return bless({},'FakeDBH2'); };
+		my $call = 0;
+		local *Ora2Pg::_src_prepare_source_sth = sub {
+			my ($self,$table,$sql)=@_; push @sqls,$sql; $call++;
+			if ($call==1) {
+				my $s = FakePagedSTH2->new($dataset,5, fail_at=>0, fail_err=>3113, fail_errstr=>'ORA-03113: boom', fail_state=>'');
+				return $s;
+			} else {
+				return FakePagedSTH2->new($dataset,5);
+			}
+		};
+		my $total = $o->_extract_resumable_bulk($q,'FT',[],[],'INSERT',['ID'],['bigint'],'',['NUMBER'],undef,undef,{});
+		is($total,4,'paged failure before confirm restarts and completes 4');
+		is($rc,1,'one reconnect for early failure');
+		is_deeply(\@sent,[qw(1 2 3 4)],'no duplication after early failure');
+		like($sqls[1],qr/FETCH FIRST 5/, 'retry query still paged');
+	}
+
+	# PK captured before writer modifies values
+	{
+		my $dataset = [1,2,3,4,5,6];
+		my $o = make_obj(source_page_size => 5, data_limit => 2, db_version => 'Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production', transaction => 'SET TRANSACTION ISOLATION LEVEL SERIALIZABLE');
+		$o->{tables}{PKM}{unique_key} = { PK1 => { type => 'P', columns => ['ID'] } };
+		$o->{tables}{PKM}{column_info} = { ID => ['ID', 'NUMBER', 22, 'N', undef, undef, undef, undef, 'PKM', '', 'NO', 1] };
+		$o->{tables}{PKM}{table_info} = { num_rows => 6 };
+		$o->{colinfo} = { PKM => { ID => { nullable => 'N' } } };
+		$o->{prefix}='DBA'; $o->{data_type}={NUMBER=>'numeric'}; $o->{user_type}={}; $o->{spatial_srid}={}; $o->{nullable}={}; $o->{local_data_limit}={}; $o->{bfile_found}=''; $o->{has_dbms_log_execute_privilege}=0; $o->{empty_lob_null}=0; $o->{enable_blob_export}=1; $o->{enable_clob_export}=1; $o->{trim_type}='BOTH'; $o->{trim_char}=' '; $o->{geometry_extract_type}='WKT';
+		my $q=$o->_howto_get_data('PKM',['ID'],['bigint'],['NUMBER'],undef,undef);
+		no warnings 'redefine';
+		local *Ora2Pg::_dump_to_pg = sub {
+			my ($self,$proc,$rows,@r)=@_;
+			# Writer mutates values (e.g., formatting); checkpoint must have been captured before.
+			foreach my $rr (@$rows){ $rr->[0] = "MUTATED"; }
+			return 1;
+		};
+		local *Ora2Pg::_src_page_renew_txn = sub { return 1; };
+		local *Ora2Pg::_src_reconnect = sub { fail('mutating writer must not trigger reconnect'); return undef; };
+		local *Ora2Pg::_src_prepare_source_sth = sub { return FakePagedSTH2->new($dataset,5); };
+		my $total=$o->_extract_resumable_bulk($q,'PKM',[],[],'INSERT',['ID'],['bigint'],'',['NUMBER'],undef,undef,{});
+		is($total,6,'mutating writer still totals 6 (checkpoint before writer)');
+	}
+
+	# PG failure never advances checkpoint
+	{
+		foreach my $t (qw(COPY INSERT)) {
+			my $o=make_obj(type=>$t, source_page_size=>5, data_limit=>2, db_version=>'Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production', transaction=>'SET TRANSACTION ISOLATION LEVEL SERIALIZABLE');
+			$o->{tables}{PGF2}{unique_key}={PK1=>{type=>'P',columns=>['ID']}};
+			$o->{tables}{PGF2}{column_info}={ID=>['ID','NUMBER',22,'N',undef,undef,undef,undef,'PGF2','','NO',1]};
+			$o->{tables}{PGF2}{table_info}={num_rows=>4};
+			$o->{colinfo}={PGF2=>{ID=>{nullable=>'N'}}};
+			$o->{prefix}='DBA'; $o->{data_type}={NUMBER=>'numeric'}; $o->{user_type}={}; $o->{spatial_srid}={}; $o->{nullable}={}; $o->{local_data_limit}={}; $o->{bfile_found}=''; $o->{has_dbms_log_execute_privilege}=0; $o->{empty_lob_null}=0; $o->{enable_blob_export}=1; $o->{enable_clob_export}=1; $o->{trim_type}='BOTH'; $o->{trim_char}=' '; $o->{geometry_extract_type}='WKT';
+			my $q=$o->_howto_get_data('PGF2',['ID'],['bigint'],['NUMBER'],undef,undef);
+			no warnings 'redefine';
+			local *Ora2Pg::_src_prepare_source_sth = sub { return FakePagedSTH2->new([1,2,3,4],5); };
+			local *Ora2Pg::_src_page_renew_txn = sub { return 1; };
+			local *Ora2Pg::_dump_to_pg = sub { die "FATAL: PG copy failed\n"; };
+			local *Ora2Pg::_src_reconnect = sub { fail("PG $t must not reconnect paged"); return undef; };
+			my $died=''; eval{$o->_extract_resumable_bulk($q,'PGF2',[],[],'X',['ID'],['bigint'],'',['NUMBER'],undef,undef,{});1;} or $died=$@;
+			like($died,qr/PG copy failed/,"paged PG $t failure propagates");
+			is($o->{current_total_row},0,"paged PG $t counters not advanced");
+		}
+	}
+
+	# ORA-01555 stays FATAL with pagination
+	{
+		my $o=make_obj(source_page_size=>5, data_limit=>2, db_version=>'Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production', transaction=>'SET TRANSACTION ISOLATION LEVEL SERIALIZABLE');
+		$o->{tables}{SS}{unique_key}={PK1=>{type=>'P',columns=>['ID']}};
+		$o->{tables}{SS}{column_info}={ID=>['ID','NUMBER',22,'N',undef,undef,undef,undef,'SS','','NO',1]};
+		$o->{tables}{SS}{table_info}={num_rows=>4};
+		$o->{colinfo}={SS=>{ID=>{nullable=>'N'}}};
+		$o->{prefix}='DBA'; $o->{data_type}={NUMBER=>'numeric'}; $o->{user_type}={}; $o->{spatial_srid}={}; $o->{nullable}={}; $o->{local_data_limit}={}; $o->{bfile_found}=''; $o->{has_dbms_log_execute_privilege}=0; $o->{empty_lob_null}=0; $o->{enable_blob_export}=1; $o->{enable_clob_export}=1; $o->{trim_type}='BOTH'; $o->{trim_char}=' '; $o->{geometry_extract_type}='WKT';
+		my $q=$o->_howto_get_data('SS',['ID'],['bigint'],['NUMBER'],undef,undef);
+		no warnings 'redefine';
+		local *Ora2Pg::_src_prepare_source_sth = sub { return FakePagedSTH2->new([1,2,3,4],5, fail_at=>0, fail_err=>1555, fail_errstr=>'ORA-01555: snapshot too old', fail_state=>'', die_on_fetch=>0); };
+		local *Ora2Pg::_src_page_renew_txn = sub { return 1; };
+		local *Ora2Pg::_dump_to_pg = sub { return 1; };
+		local *Ora2Pg::_src_reconnect = sub { fail('ORA-01555 must not reconnect'); return undef; };
+		my $died=''; eval{$o->_extract_resumable_bulk($q,'SS',[],[],'X',['ID'],['bigint'],'',['NUMBER'],undef,undef,{});1;} or $died=$@;
+		like($died,qr/ORA-01555|Aborting/i,'paged ORA-01555 fatal');
+	}
+}
+
+# --- 27. Paged LOB with boundary in middle of DATA_LIMIT+1 buffer ---
+{
+	package FakePagedRowSTH;
+	sub new {
+		my ($class,$rows,$page_size,%o)=@_;
+		return bless { rows=>[@$rows], page_size=>$page_size, pos=>0, calls=>0, fail_at=>$o{fail_at}, fail_err=>$o{fail_err}, fail_errstr=>$o{fail_errstr}||'', fail_state=>$o{fail_state}||'', die_on_fetch=>$o{die_on_fetch}||0, err=>undef, errstr=>'', state=>'', finished=>0 }, $class;
+	}
+	sub execute {
+		my ($self,@bind)=@_;
+		my $cp=@bind?$bind[0]:undef;
+		my @f;
+		foreach my $r (@{$self->{rows}}) {
+			if (!defined $cp){push @f,$r;}
+			else{push @f,$r if (0+$r->[0] > 0+$cp);}
+		}
+		splice(@f,$self->{page_size}) if (@f>$self->{page_size});
+		$self->{page_rows}=[@f];
+		$self->{pos}=0; $self->{calls}=0;
+		return 1;
+	}
+	sub fetchrow_array {
+		my ($self)=@_;
+		my $idx=$self->{calls}++;
+		if (defined $self->{fail_at} && $idx==$self->{fail_at}){
+			$self->{err}=$self->{fail_err}; $self->{errstr}=$self->{fail_errstr}; $self->{state}=$self->{fail_state};
+			die $self->{fail_errstr} if ($self->{die_on_fetch});
+			return ();
+		}
+		if ($self->{pos}>=@{$self->{page_rows}}){$self->{err}=undef;$self->{errstr}='';$self->{state}='';return ();}
+		$self->{err}=undef;$self->{errstr}='';$self->{state}='';
+		return @{$self->{page_rows}->[$self->{pos}++]};
+	}
+	sub err{return $_[0]->{err};} sub errstr{return $_[0]->{errstr};} sub state{return $_[0]->{state};} sub finish{return 1;} 
+	package main;
+	my $o=make_obj(source_page_size=>5, data_limit=>2, db_version=>'Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production', transaction=>'SET TRANSACTION ISOLATION LEVEL SERIALIZABLE', lob_chunk_size=>8192, use_lob_locator=>1);
+	$o->{tables}{LT2}{unique_key}={PK1=>{type=>'P',columns=>['ID']}};
+	$o->{tables}{LT2}{column_info}={ID=>['ID','NUMBER',22,'N',undef,undef,undef,undef,'LT2','','NO',1], DATA=>['DATA','CLOB',4000,'Y',undef,undef,undef,undef,'LT2','','NO',2]};
+	$o->{tables}{LT2}{table_info}={num_rows=>7};
+	$o->{colinfo}={LT2=>{ID=>{nullable=>'N'},DATA=>{nullable=>'Y'}}};
+	$o->{prefix}='DBA'; $o->{data_type}={NUMBER=>'numeric',CLOB=>'text'}; $o->{user_type}={}; $o->{spatial_srid}={}; $o->{nullable}={}; $o->{local_data_limit}={}; $o->{bfile_found}=''; $o->{has_dbms_log_execute_privilege}=0; $o->{empty_lob_null}=0; $o->{enable_blob_export}=1; $o->{enable_clob_export}=1; $o->{trim_type}='BOTH'; $o->{trim_char}=' '; $o->{geometry_extract_type}='WKT';
+	$o->{dbh}=FakeOracleDBH->new();
+	my $dataset=[[1,'LOC1'],[2,'LOC2'],[3,'LOC3'],[4,'LOC4'],[5,'LOC5'],[6,'LOC6'],[7,'LOC7']];
+	my $q=$o->_howto_get_data('LT2',['ID','DATA'],['bigint','text'],['NUMBER','CLOB'],undef,undef);
+	like($q,qr/FETCH FIRST 5/, 'lob paged initial has limit');
+	my @sent; my @sqls;
+	no warnings 'redefine';
+	local *Ora2Pg::_dump_to_pg = sub { my ($self,$proc,$rows,@r)=@_; foreach my $rr (@$rows){push @sent,["$rr->[0]","$rr->[1]"];} return 1; };
+	local *Ora2Pg::_src_page_renew_txn = sub { return 1; };
+	local *Ora2Pg::_src_reconnect = sub { fail('healthy lob paged must not reconnect'); return bless({},'FakeDBH2'); };
+	local *Ora2Pg::_src_prepare_source_sth = sub { my ($self,$table,$sql)=@_; push @sqls,$sql; return FakePagedRowSTH->new($dataset,5); };
+	my $total=$o->_extract_resumable_lob($q,'LT2',[],[],'X',['ID','DATA'],['bigint','text'],'',['NUMBER','CLOB'],undef,undef,{});
+	is($total,7,'paged lob 7 rows with 5/2 (boundary in DATA_LIMIT+1) completes');
+	is(scalar(@sent),7,'all lob rows sent');
+	is($sent[0][1],'CONTENT-LOC1','lob content intact paged');
+	is($sent[6][0],'7','last lob id');
+	my $nulls=grep{!defined $_->[1]} @sent; ok($nulls==0,'no NULL from paged lob');
+	is(scalar(@sqls),2,'two pages (5,2) for 7 rows');
+}
+
+# --- 28. Renewal order, no PG txn, no initial command replay, zero disables ---
+{
+	# Order: finish before rollback, begin_work/isolation before SELECT
+	{
+		my @order;
+		my $fake_dbh = bless { calls=>\@order, AutoCommit=>0 }, 'FakeOrderDBH';
+		{
+			package FakeOrderDBH;
+			sub rollback { push @{$_[0]->{calls}}, 'rollback'; return 1; }
+			sub begin_work { push @{$_[0]->{calls}}, 'begin_work'; return 1; }
+			sub prepare {
+				my ($self,$sql)=@_;
+				push @{$self->{calls}}, "prepare:$sql";
+				return bless { calls=>$self->{calls}, sql=>$sql }, 'FakeOrderSTH';
+			}
+			sub err { return undef; } sub errstr { return ''; } sub state { return ''; }
+		}
+		{
+			package FakeOrderSTH;
+			sub execute { push @{$_[0]->{calls}}, 'execute:'.$_[0]->{sql}; return 1; }
+			sub finish { push @{$_[0]->{calls}}, 'finish'; return 1; }
+			sub err { return undef; } sub errstr { return ''; } sub state { return ''; }
+		}
+		my $o=make_obj(source_page_size=>5, db_version=>'Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production', transaction=>'SET TRANSACTION ISOLATION LEVEL SERIALIZABLE');
+		$o->{dbh}=$fake_dbh;
+		$o->{dbhdest}=bless({},'FakeGuardDBH2');
+		{
+			package FakeGuardDBH2;
+			sub rollback { die "PG rollback must not be called"; }
+			sub commit { die "PG commit must not be called"; }
+		}
+		my $prev_ora = \&Ora2Pg::_ora_initial_command;
+		no warnings 'redefine';
+		local *Ora2Pg::_ora_initial_command = sub { die "ORA_INITIAL_COMMAND replayed"; };
+		# Simulate: materialize LOB (no-op), finish prev, renew, prepare SELECT
+		push @order, 'lob_materialized';
+		my $prev_sth = bless { calls=>\@order }, 'FakeOrderSTH';
+		$o->_src_page_renew_txn('T', $prev_sth);
+		# Renew does finish(prev), rollback, begin_work, prepare isolation
+		# Then normal prepare for SELECT (action + SELECT)
+		my $sel = $fake_dbh->prepare('SELECT a."ID" FROM "T" a ORDER BY a."ID" FETCH FIRST 5 ROWS ONLY');
+		$sel->execute();
+		# Verify order: lob_materialized, finish, rollback, begin_work, prepare isolation, execute isolation, prepare SELECT...
+		my $j=join('|',@order);
+		like($j,qr/lob_materialized.*finish.*rollback.*begin_work.*prepare:SET TRANSACTION.*execute:SET TRANSACTION.*prepare:SELECT/i,'DBI order: finish+LOB before rollback, isolation before SELECT');
+		unlike($j,qr/PG/i,'no PG txn');
+	}
+
+	# SOURCE_PAGE_SIZE=0 never renews
+	{
+		my $o=make_obj(source_page_size=>0, data_limit=>2, db_version=>'Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production');
+		$o->{tables}{ZR}{unique_key}={PK1=>{type=>'P',columns=>['ID']}};
+		$o->{tables}{ZR}{column_info}={ID=>['ID','NUMBER',22,'N',undef,undef,undef,undef,'ZR','','NO',1]};
+		$o->{tables}{ZR}{table_info}={num_rows=>2};
+		$o->{_src_resume}{ZR}={pk_idx=>0, pk_alias_quoted=>'a."ID"', base=>'SELECT a."ID" FROM "ZR" a', has_where=>0, order=>' ORDER BY a."ID"', paged=>0, page_size=>0, backend=>'oracle'};
+		no warnings 'redefine';
+		local *Ora2Pg::_src_page_renew_txn = sub { fail('page_size 0 must not renew'); return 1; };
+		local *Ora2Pg::_src_prepare_source_sth = sub { return FakeBulkSTH->new(blocks=>[[[1],[2]]]); };
+		*FakeBulkSTH::execute = sub { return 1; };
+		local *Ora2Pg::_dump_to_pg = sub { return 1; };
+		local *Ora2Pg::_src_reconnect = sub { fail('no reconnect expected'); return undef; };
+		my $total=$o->_extract_resumable_bulk('SELECT a."ID" FROM "ZR" a ORDER BY a."ID"','ZR',[],[],'X',['ID'],['bigint'],'',['NUMBER'],undef,undef,{});
+		is($total,2,'page_size 0 non-paginated still works without renew');
+	}
+
+	# Flashback warning once, query preserves AS OF
+	{
+		my $o=make_obj(source_page_size=>5, db_version=>'Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production', transaction=>'SET TRANSACTION ISOLATION LEVEL SERIALIZABLE', start_scn=>'123456');
+		$o->{tables}{FB}{unique_key}={PK1=>{type=>'P',columns=>['ID']}};
+		$o->{tables}{FB}{column_info}={ID=>['ID','NUMBER',22,'N',undef,undef,undef,undef,'FB','','NO',1]};
+		$o->{tables}{FB}{table_info}={nested=>'NO',owner=>'SC',num_rows=>5};
+		$o->{colinfo}={FB=>{ID=>{nullable=>'N'}}};
+		$o->{prefix}='DBA'; $o->{data_type}={NUMBER=>'numeric'}; $o->{user_type}={}; $o->{spatial_srid}={}; $o->{nullable}={}; $o->{local_data_limit}={}; $o->{bfile_found}=''; $o->{has_dbms_log_execute_privilege}=0; $o->{empty_lob_null}=0; $o->{enable_blob_export}=1; $o->{enable_clob_export}=1; $o->{trim_type}='BOTH'; $o->{trim_char}=' '; $o->{geometry_extract_type}='WKT';
+		my $q=$o->_howto_get_data('FB',['ID'],['bigint'],['NUMBER'],undef,undef);
+		like($q,qr/AS OF SCN 123456/i,'flashback preserved in paged template');
+		like($q,qr/FETCH FIRST 5/,'paged limit with flashback');
+		ok($o->{_src_page_flashback_warned}{fb},'flashback warning flagged once');
+		my $rsql=$o->_src_resume_sql('FB');
+		like($rsql,qr/AS OF SCN 123456.*WHERE.*> \?.*FETCH FIRST 5/i,'resume paged preserves flashback');
+	}
+
+	# USER_GRANTS=1/prefix ALL and no_start_scn preserved with paging
+	{
+		my $o=make_obj(source_page_size=>5, db_version=>'Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production', transaction=>'SET TRANSACTION READ ONLY', prefix=>'ALL', user_grants=>1, no_start_scn=>1, start_scn=>'');
+		$o->{tables}{UG}{unique_key}={PK1=>{type=>'P',columns=>['ID']}};
+		$o->{tables}{UG}{column_info}={ID=>['ID','NUMBER',22,'N',undef,undef,undef,undef,'UG','','NO',1]};
+		$o->{tables}{UG}{table_info}={nested=>'NO',owner=>'SC',num_rows=>5};
+		$o->{colinfo}={UG=>{ID=>{nullable=>'N'}}};
+		$o->{data_type}={NUMBER=>'numeric'}; $o->{user_type}={}; $o->{spatial_srid}={}; $o->{nullable}={}; $o->{local_data_limit}={}; $o->{bfile_found}=''; $o->{has_dbms_log_execute_privilege}=0; $o->{empty_lob_null}=0; $o->{enable_blob_export}=1; $o->{enable_clob_export}=1; $o->{trim_type}='BOTH'; $o->{trim_char}=' '; $o->{geometry_extract_type}='WKT';
+		$o->{current_oracle_scn}={};
+		my $q=$o->_howto_get_data('UG',['ID'],['bigint'],['NUMBER'],undef,undef);
+		like($q,qr/ORDER BY a\."ID" FETCH FIRST 5 ROWS ONLY/,'user_grants paged still ordered+limited');
+		unlike($q,qr/AS OF SCN|AS OF TIMESTAMP/i,'no_start_scn adds no flashback');
+		is($o->{prefix},'ALL','prefix ALL preserved');
+		ok($o->{_src_resume}{UG}{paged},'user_grants paged capable');
+	}
+
+	# Paged path never recalls _export_table_data/_dump_table (no DELETE/TRUNCATE repeat)
+	{
+		my $o=make_obj(source_page_size=>5, data_limit=>2, db_version=>'Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production', transaction=>'SET TRANSACTION ISOLATION LEVEL SERIALIZABLE');
+		$o->{tables}{NT}{unique_key}={PK1=>{type=>'P',columns=>['ID']}};
+		$o->{tables}{NT}{column_info}={ID=>['ID','NUMBER',22,'N',undef,undef,undef,undef,'NT','','NO',1]};
+		$o->{tables}{NT}{table_info}={num_rows=>6};
+		$o->{colinfo}={NT=>{ID=>{nullable=>'N'}}};
+		$o->{prefix}='DBA'; $o->{data_type}={NUMBER=>'numeric'}; $o->{user_type}={}; $o->{spatial_srid}={}; $o->{nullable}={}; $o->{local_data_limit}={}; $o->{bfile_found}=''; $o->{has_dbms_log_execute_privilege}=0; $o->{empty_lob_null}=0; $o->{enable_blob_export}=1; $o->{enable_clob_export}=1; $o->{trim_type}='BOTH'; $o->{trim_char}=' '; $o->{geometry_extract_type}='WKT';
+		my $q=$o->_howto_get_data('NT',['ID'],['bigint'],['NUMBER'],undef,undef);
+		no warnings 'redefine';
+		local *Ora2Pg::_export_table_data = sub { fail('paged must not recall _export_table_data'); return 0; };
+		local *Ora2Pg::_dump_table = sub { fail('paged must not recall _dump_table'); return 0; };
+		local *Ora2Pg::_src_page_renew_txn = sub { return 1; };
+		local *Ora2Pg::_src_prepare_source_sth = sub { return FakePagedSTH2->new([1,2,3,4,5,6],5); };
+		local *Ora2Pg::_dump_to_pg = sub { return 1; };
+		local *Ora2Pg::_src_reconnect = sub { fail('no reconnect expected'); return undef; };
+		my $total=$o->_extract_resumable_bulk($q,'NT',[],[],'X',['ID'],['bigint'],'',['NUMBER'],undef,undef,{});
+		is($total,6,'paged completes without recalling export/dump (DELETE/TRUNCATE once outside)');
+	}
+}
+
 done_testing();

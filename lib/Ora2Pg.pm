@@ -1535,6 +1535,10 @@ sub _init
 	$self->{oracle_copies} ||= 0;
 	$self->{ora_conn_count} = 0;
 	$self->{data_limit} ||= 10000;
+	$self->{source_page_size} = $self->_validate_source_page_size(
+		exists $self->{source_page_size} ? $self->{source_page_size} : undef,
+		!exists $self->{source_page_size} ? 1 : 0
+	);
 	$self->{blob_limit} ||= 0;
 	$self->{clob_as_blob} ||= 0;
 	$self->{disable_partition} ||= 0;
@@ -12482,6 +12486,18 @@ sub _howto_get_data
 	# is quoted/mutated below. Uses raw source PK values.
 	my ($resume_info, $resume_reason) = $self->_src_resume_info($table, $name, $src_type, $part_name);
 
+	# Keyset pagination reuses resume eligibility; the pagination flag is
+	# separate from retry eligibility. SOURCE_PAGE_SIZE=0 preserves the
+	# previous query, isolation and retry path.
+	my $page_size = $self->_src_page_size();
+	my ($paged, $page_reason) = (0, undef);
+	if (defined $resume_info) {
+		($paged, $page_reason) = $self->_src_page_capable($table, $resume_info);
+	}
+	# Oracle FETCH FIRST requires unique output names: alias every
+	# generated expression when paged. MSSQL TOP needs no alias.
+	my $need_page_alias = ($paged && !$self->{is_mssql} && !$self->{is_mysql}) ? 1 : 0;
+
 	# Fix a problem when the table need to be prefixed by the schema
 	my $realtable = $table;
 	$realtable =~ s/\"//g;
@@ -12634,6 +12650,28 @@ sub _howto_get_data
 				}
 			}
 
+			# Unique output alias for paginated Oracle (FETCH FIRST).
+			# Derived from the source column name; trim branch keeps its
+			# already correct alias.
+			my $page_alias = '';
+			my $pa = '';
+			if ($need_page_alias) {
+				my $raw_alias = $realcolname;
+				$raw_alias = $raw_alias->[0] if (ref($raw_alias) eq 'ARRAY');
+				$raw_alias = '' if (!defined $raw_alias);
+				my $c = "$raw_alias";
+				$c =~ s/^[\s"`\[\]]+//;
+				$c =~ s/[\s"`\[\]]+$//;
+				$c =~ s/"//g;
+				$c =~ s/[\[\]]//g;
+				$c =~ s/^\s+//;
+				$c =~ s/\s+$//;
+				if ($c ne '') {
+					$page_alias = '"' . $c . '"';
+					$pa = " AS $page_alias";
+				}
+			}
+
 			# If there is any transformation to apply replace the column name with the clause
 			if (exists $self->{transform_value}{lc($table)} && exists $self->{transform_value}{lc($table)}{lc($realcolname)}) {
 				$str .= $self->{transform_value}{lc($table)}{lc($realcolname)} . ",";
@@ -12650,35 +12688,35 @@ sub _howto_get_data
 			elsif ( ($src_type->[$k] =~ /bfile/i) && ($type->[$k] =~ /bytea/i) )
 			{
 				$self->{bfile_found} = 'bytea';
-				$str .= "ora2pg_get_bfile($alias.$name->[$k]),";
+				$str .= "ora2pg_get_bfile($alias.$name->[$k])$pa,";
 			}
 			# If dest type is efile the content of the file is exported to use the efile extension
 			elsif ( ($src_type->[$k] =~ /bfile/i) && ($type->[$k] =~ /efile/i) )
 			{
 				$self->{bfile_found} = 'efile';
-				$str .= "ora2pg_get_efile($alias.$name->[$k]),";
+				$str .= "ora2pg_get_efile($alias.$name->[$k])$pa,";
 			}
 			# Only extract path to the bfile if dest type is text.
 			elsif ( ($src_type->[$k] =~ /bfile/i) && ($type->[$k] =~ /text/i) )
 			{
 				$self->{bfile_found} = 'text';
-				$str .= "ora2pg_get_bfilename($alias.$name->[$k]),";
+				$str .= "ora2pg_get_bfilename($alias.$name->[$k])$pa,";
 			}
 			elsif ( $src_type->[$k] =~ /xmltype/i)
 			{
 				if ($self->{xml_pretty}) {
-					$str .= "($alias.$name->[$k]).getStringVal(),";
+					$str .= "($alias.$name->[$k]).getStringVal()$pa,";
 				} else {
-					$str .= "($alias.$name->[$k]).getClobVal(),";
+					$str .= "($alias.$name->[$k]).getClobVal()$pa,";
 				}
 			}
 			# ArcGis Geometries
 			elsif ( !$self->{is_mysql} && $src_type->[$k] =~ /^(ST_|STGEOM_)/i)
 			{
 				if ($self->{geometry_extract_type} eq 'WKB') {
-					$str .= "CASE WHEN $alias.$name->[$k] IS NOT NULL THEN $self->{st_asbinary_function}($alias.$name->[$k]) ELSE NULL END,";
+					$str .= "CASE WHEN $alias.$name->[$k] IS NOT NULL THEN $self->{st_asbinary_function}($alias.$name->[$k]) ELSE NULL END$pa,";
 				} else {
-					$str .= "CASE WHEN $alias.$name->[$k] IS NOT NULL THEN $self->{st_astext_function}($alias.$name->[$k]) ELSE NULL END,";
+					$str .= "CASE WHEN $alias.$name->[$k] IS NOT NULL THEN $self->{st_astext_function}($alias.$name->[$k]) ELSE NULL END$pa,";
 				}
 			}
 			# Oracle geometries
@@ -12696,21 +12734,21 @@ sub _howto_get_data
 				if ($self->{type} eq 'INSERT')
 				{
 					if ($self->{geometry_extract_type} eq 'WKB') {
-						$str .= "CASE WHEN $alias.$name->[$k] IS NOT NULL THEN SDO_UTIL.TO_WKBGEOMETRY($alias.$name->[$k]) ELSE NULL END,";
+						$str .= "CASE WHEN $alias.$name->[$k] IS NOT NULL THEN SDO_UTIL.TO_WKBGEOMETRY($alias.$name->[$k]) ELSE NULL END$pa,";
 					} elsif ($self->{geometry_extract_type} eq 'INTERNAL') {
-						$str .= "CASE WHEN $alias.$name->[$k] IS NOT NULL THEN $alias.$name->[$k] ELSE NULL END,";
+						$str .= "CASE WHEN $alias.$name->[$k] IS NOT NULL THEN $alias.$name->[$k] ELSE NULL END$pa,";
 					} else {
-						$str .= "CASE WHEN $alias.$name->[$k] IS NOT NULL THEN ST_GeomFromText(SDO_UTIL.TO_WKTGEOMETRY($alias.$name->[$k]), '$spatial_srid') ELSE NULL END,";
+						$str .= "CASE WHEN $alias.$name->[$k] IS NOT NULL THEN ST_GeomFromText(SDO_UTIL.TO_WKTGEOMETRY($alias.$name->[$k]), '$spatial_srid') ELSE NULL END$pa,";
 					}
 				}
 				else
 				{
 					if ($self->{geometry_extract_type} eq 'WKB') {
-						$str .= "CASE WHEN $alias.$name->[$k] IS NOT NULL THEN SDO_UTIL.TO_WKBGEOMETRY($alias.$name->[$k]) ELSE NULL END,";
+						$str .= "CASE WHEN $alias.$name->[$k] IS NOT NULL THEN SDO_UTIL.TO_WKBGEOMETRY($alias.$name->[$k]) ELSE NULL END$pa,";
 					} elsif ($self->{geometry_extract_type} eq 'INTERNAL') {
-						$str .= "CASE WHEN $alias.$name->[$k] IS NOT NULL THEN $alias.$name->[$k] ELSE NULL END,";
+						$str .= "CASE WHEN $alias.$name->[$k] IS NOT NULL THEN $alias.$name->[$k] ELSE NULL END$pa,";
 					} else {
-						$str .= "CASE WHEN $alias.$name->[$k] IS NOT NULL THEN SDO_UTIL.TO_WKTGEOMETRY($alias.$name->[$k]) ELSE NULL END,";
+						$str .= "CASE WHEN $alias.$name->[$k] IS NOT NULL THEN SDO_UTIL.TO_WKTGEOMETRY($alias.$name->[$k]) ELSE NULL END$pa,";
 					}
 				}
 			}
@@ -12775,14 +12813,14 @@ sub _howto_get_data
 					} else {
 						$str .= "dbms_lob.getlength";
 					}
-					$str .= "($alias.$name->[$k]) = 0 THEN NULL ELSE $alias.$name->[$k] END,";
+					$str .= "($alias.$name->[$k]) = 0 THEN NULL ELSE $alias.$name->[$k] END$pa,";
 				} else {
-					$str .= "$alias.$name->[$k],";
+					$str .= "$alias.$name->[$k]$pa,";
 				}
 			}
 			else
 			{
-				$str .= "$alias.$name->[$k],";
+				$str .= "$alias.$name->[$k]$pa,";
 			}
 			push(@{$self->{spatial_srid}{$table}}, $spatial_srid);
 			
@@ -13031,18 +13069,65 @@ END;
 	# The predicate is injected structurally here (no regex rewrite of
 	# arbitrary SQL), with a DBI placeholder. ORDER BY always uses the
 	# source column. Checkpoint values stay raw source strings.
+	# Keyset pagination (when active) adds a native row limit once:
+	# Oracle ORDER BY pk FETCH FIRST N ROWS ONLY, MSSQL SELECT TOP (N)
+	# ... ORDER BY pk. N is the validated configuration integer.
 	if (defined $resume_info) {
 		my $base = $str;
 		my $order = " ORDER BY $resume_info->{pk_alias_quoted}";
-		$str = $base . $order;
-		$self->{_src_resume}{$table} = {
-			pk_src => $resume_info->{pk_src},
-			pk_idx => $resume_info->{pk_idx},
-			pk_alias_quoted => $resume_info->{pk_alias_quoted},
-			base => $base,
-			has_where => ($base =~ / WHERE /i) ? 1 : 0,
-			order => $order,
-		};
+		my $has_where = ($base =~ / WHERE /i) ? 1 : 0;
+		if ($paged) {
+			my $backend = $self->_src_backend();
+			if ($backend eq 'mssql') {
+				my $paged_base = $self->_src_inject_mssql_top($base, $page_size);
+				$str = $paged_base . $order;
+			} else {
+				my $n = int($page_size);
+				$str = $base . $order . " FETCH FIRST $n ROWS ONLY";
+			}
+			$self->{_src_resume}{$table} = {
+				pk_src => $resume_info->{pk_src},
+				pk_idx => $resume_info->{pk_idx},
+				pk_alias_quoted => $resume_info->{pk_alias_quoted},
+				base => $base,
+				has_where => $has_where,
+				order => $order,
+				paged => 1,
+				page_size => int($page_size),
+				backend => $backend,
+			};
+			$self->logit("Paginazione keyset attiva per tabella $table: page_size " . int($page_size) . " ($backend)\n", 1);
+			# Explicit or automatic flashback stays in every page template:
+			# pagination renews only the source transaction, not the
+			# flashback snapshot, so it does not remove undo risk.
+			if (($self->{start_scn} && $self->{start_scn} ne '') || exists $self->{current_oracle_scn}{$table}) {
+				if (!$self->{_src_page_flashback_warned}{"\L$table\E"}) {
+					$self->{_src_page_flashback_warned}{"\L$table\E"} = 1;
+					$self->logit("WARNING: paginazione attiva per tabella $table con flashback (AS OF SCN/TIMESTAMP): ogni pagina riusa lo stesso snapshot flashback, il rischio undo (ORA-01555) non e' eliminato.\n", 0);
+				}
+			}
+		} else {
+			$str = $base . $order;
+			$self->{_src_resume}{$table} = {
+				pk_src => $resume_info->{pk_src},
+				pk_idx => $resume_info->{pk_idx},
+				pk_alias_quoted => $resume_info->{pk_alias_quoted},
+				base => $base,
+				has_where => $has_where,
+				order => $order,
+				paged => 0,
+				page_size => 0,
+				backend => $self->_src_backend(),
+			};
+			# Log pagination fallback once (version/transform); silence the
+			# explicit SOURCE_PAGE_SIZE=0 case which preserves the old path.
+			if (defined $page_reason && $page_reason !~ /disabilitata/i) {
+				if (!$self->{_src_page_logged}{"\L$table\E"}) {
+					$self->{_src_page_logged}{"\L$table\E"} = 1;
+					$self->logit("Paginazione non attiva per tabella $table: $page_reason; uso resume non paginato\n", 1);
+				}
+			}
+		}
 	} else {
 		delete $self->{_src_resume}{$table};
 		if (defined $resume_reason && !$self->{_src_resume_logged}{"\L$table\E"}) {
@@ -16802,6 +16887,206 @@ sub _src_retry_column_attributes
 	}
 }
 
+=head2 _validate_source_page_size
+
+Validates SOURCE_PAGE_SIZE during _init. Default 100000 when missing,
+0 disables pagination and preserves the previous path. Dies FATAL on
+negative, fractional, empty explicit or non-numeric values. Must not
+use ||= so that an explicit 0 is preserved.
+
+=cut
+
+sub _validate_source_page_size
+{
+	my ($self, $val, $is_missing) = @_;
+
+	if ($is_missing) {
+		return 100000;
+	}
+	if (!defined $val || "$val" =~ /^\s*$/) {
+		$self->logit("FATAL: invalid SOURCE_PAGE_SIZE value (empty), must be a non-negative integer, 0 disables pagination.\n", 0, 1);
+	}
+	my $v = "$val";
+	$v =~ s/^\s+//;
+	$v =~ s/\s+$//;
+	if ($v !~ /^\d+$/) {
+		$self->logit("FATAL: invalid SOURCE_PAGE_SIZE value '$v', must be a non-negative integer, 0 disables pagination.\n", 0, 1);
+	}
+	return int($v);
+}
+
+=head2 _src_page_size
+
+Returns the validated SOURCE_PAGE_SIZE. Defaults to 100000 when the
+object bypassed _init (tests). An explicit 0 disables pagination.
+
+=cut
+
+sub _src_page_size
+{
+	my ($self) = @_;
+
+	return 100000 if (!exists $self->{source_page_size} || !defined $self->{source_page_size});
+	my $v = "$self->{source_page_size}";
+	$v =~ s/^\s+//;
+	$v =~ s/\s+$//;
+	return 100000 if ($v eq '');
+	return int($v) if ($v =~ /^\d+$/);
+	return 100000;
+}
+
+=head2 _src_oracle_supports_pages
+
+True when the Oracle server version is recognized as >= 12c and can
+use FETCH FIRST. Unknown or older versions keep the single cursor.
+
+=cut
+
+sub _src_oracle_supports_pages
+{
+	my ($self) = @_;
+
+	my $ver = $self->{db_version} || '';
+	return 0 if ($ver eq '');
+	# 19c / 12c / 11g style
+	if ($ver =~ /(\d+)\s*[cg]\b/i) {
+		return ($1 >= 12) ? 1 : 0;
+	}
+	# Release 12 / 19 style
+	if ($ver =~ /Release\s+(\d+)/i) {
+		return ($1 >= 12) ? 1 : 0;
+	}
+	# Dotted version 19.0.0.0.0 style
+	if ($ver =~ /(\d+)\.\d+/) {
+		return ($1 >= 12) ? 1 : 0;
+	}
+	# Bare major number
+	if ($ver =~ /\b(\d{2,})\b/) {
+		return ($1 >= 12) ? 1 : 0;
+	}
+	return 0;
+}
+
+=head2 _src_page_capable
+
+Decides whether keyset pagination can be used for this table. Reuses
+the resume eligibility and separates the pagination flag from it.
+Returns (1, undef) when paged, or (0, reason) to keep the current
+non-paginated resume path.
+
+=cut
+
+sub _src_page_capable
+{
+	my ($self, $table, $resume_info) = @_;
+
+	return (0, 'resume non attivo') if (!defined $resume_info);
+	my $page_size = $self->_src_page_size();
+	return (0, 'paginazione disabilitata (SOURCE_PAGE_SIZE=0)') if ($page_size <= 0);
+	my $backend = $self->_src_backend();
+	return (0, 'backend non supportato') if ($backend ne 'oracle' && $backend ne 'mssql');
+	# Non-PK TRANSFORM_VALUE keeps the non-paginated resume path. The
+	# transformed PK case is already non-resumable.
+	if (exists $self->{transform_value}{lc($table)}) {
+		my $pk_lc = lc($resume_info->{pk_src} || '');
+		$pk_lc =~ s/"//g;
+		$pk_lc =~ s/[\[\]]//g;
+		foreach my $ck (keys %{$self->{transform_value}{lc($table)}}) {
+			if (lc($ck) ne $pk_lc) {
+				return (0, 'TRANSFORM_VALUE non-PK');
+			}
+		}
+	}
+	if ($backend eq 'oracle') {
+		if (!$self->_src_oracle_supports_pages()) {
+			my $v = $self->{db_version} || 'sconosciuta';
+			$v =~ s/\s+/ /g;
+			$v = substr($v, 0, 80);
+			return (0, "versione Oracle non supporta FETCH FIRST ($v)");
+		}
+	}
+	return (1, undef);
+}
+
+=head2 _src_inject_mssql_top
+
+Injects TOP (N) after SELECT for paginated MSSQL queries. N is the
+already validated configuration integer, never free SQL input.
+
+=cut
+
+sub _src_inject_mssql_top
+{
+	my ($self, $base, $page_size) = @_;
+
+	my $n = int($page_size || 0);
+	my $out = $base;
+	$out =~ s/^SELECT\s+/SELECT TOP ($n) /i;
+	return $out;
+}
+
+=head2 _src_page_renew_txn
+
+Renews only the source transaction for the paginated path. Called
+before the first page of each table (even after discovery) and before
+subsequent pages. Oracle: finish statement, rollback, begin_work and
+reapply the configured isolation as the first SQL of the new
+transaction. MSSQL is normally AutoCommit: only finishes the statement
+and rolls back a non-AutoCommit handle without introducing writes.
+Never touches PG handles and never replays ORA_INITIAL_COMMAND.
+
+=cut
+
+sub _src_page_renew_txn
+{
+	my ($self, $table, $sth) = @_;
+
+	eval { $sth->finish() if ($sth); };
+	my $backend = $self->_src_backend();
+	if ($backend eq 'oracle') {
+		my $dbh = $self->{dbh};
+		if ($dbh) {
+			my $autocommit = eval { $dbh->{AutoCommit}; };
+			if (!defined $autocommit || !$autocommit) {
+				if ($dbh->can('rollback')) {
+					eval { $dbh->rollback(); };
+					if ($@ && $@ ne '') {
+						die $@;
+					}
+				}
+			}
+			if ($dbh->can('begin_work')) {
+				eval { $dbh->begin_work(); };
+				if ($@ && $@ ne '') {
+					if ($@ !~ /already|in progress|in transaction/i) {
+						die $@;
+					}
+				}
+			}
+			# Reapply isolation as the first SQL of the new transaction
+			if (defined $self->{transaction} && $self->{transaction} ne '' && $dbh->can('prepare')) {
+				my $iso_sth = $dbh->prepare($self->{transaction});
+				$iso_sth->execute();
+				eval { $iso_sth->finish() if ($iso_sth); };
+			}
+		}
+	} else {
+		# MSSQL: normally AutoCommit, keep session isolation as-is.
+		# Handle an eventual non-AutoCommit handle without writes.
+		my $dbh = $self->{dbh};
+		if ($dbh) {
+			my $autocommit = eval { $dbh->{AutoCommit}; };
+			if (defined $autocommit && !$autocommit && $dbh->can('rollback')) {
+				eval { $dbh->rollback(); };
+				if ($@ && $@ ne '') {
+					die $@;
+				}
+			}
+		}
+	}
+	return 1;
+}
+
 =head2 logrep
 
 This function log report's information to STDOUT or to a logfile.
@@ -17211,7 +17496,10 @@ sub _src_prepare_source_sth
 =head2 _src_resume_sql
 
 Builds the resume SELECT from the stored base (same projection and
-filters) with a placeholder predicate on the source PK.
+filters) with a placeholder predicate on the source PK. When keyset
+pagination is active for the table, the native page limit is included:
+Oracle FETCH FIRST N ROWS ONLY suffix, MSSQL TOP (N) prefix. N is the
+validated configuration integer.
 
 =cut
 
@@ -17221,7 +17509,18 @@ sub _src_resume_sql
 
 	my $r = $self->{_src_resume}{$table};
 	return undef if (!$r);
-	my $sql = $r->{base} . ($r->{has_where} ? ' AND ' : ' WHERE ') . $r->{pk_alias_quoted} . " > ?" . $r->{order};
+	my $pred = $r->{base} . ($r->{has_where} ? ' AND ' : ' WHERE ') . $r->{pk_alias_quoted} . " > ?";
+	if ($r->{paged}) {
+		my $n = int($r->{page_size} || 0);
+		my $backend = $r->{backend} || $self->_src_backend();
+		if ($backend eq 'mssql') {
+			my $paged_base = $self->_src_inject_mssql_top($r->{base}, $n);
+			return $paged_base . ($r->{has_where} ? ' AND ' : ' WHERE ') . $r->{pk_alias_quoted} . " > ?" . $r->{order};
+		} else {
+			return $pred . $r->{order} . " FETCH FIRST $n ROWS ONLY";
+		}
+	}
+	my $sql = $pred . $r->{order};
 	return $sql;
 }
 
@@ -17244,6 +17543,9 @@ sub _extract_resumable_bulk
 	my $resume = $self->{_src_resume}{$table};
 	if (!$resume) {
 		$self->logit("FATAL: resume info missing for table $table\n", 0, 1);
+	}
+	if ($resume->{paged}) {
+		return $self->_extract_paged_bulk($initial_sql, $table, $cmd_head, $cmd_foot, $s_out, $nn, $tt, $sprep, $stt, $part_name, $proc, $user_type_ref);
 	}
 	my $pk_idx = $resume->{pk_idx};
 	my $base = $resume->{base};
@@ -17300,7 +17602,7 @@ sub _extract_resumable_bulk
 				if ($self->_src_is_retryable($diag{err}, $diag{errstr}, $diag{state}, 'connect')) {
 					$self->_src_reconnect($table, 'connect', \%diag, $checkpoint);
 					if (defined $checkpoint) {
-						$sql = $base . ($has_where ? ' AND ' : ' WHERE ') . $pk_quoted . " > ?" . $order;
+						$sql = $self->_src_resume_sql($table);
 						@bind = ($checkpoint);
 					} else {
 						$sql = $initial_sql;
@@ -17370,7 +17672,7 @@ sub _extract_resumable_bulk
 		if ($need_resume) {
 			$self->_src_reconnect($table, 'read', \%fetch_diag, $checkpoint);
 			if (defined $checkpoint) {
-				$sql = $base . ($has_where ? ' AND ' : ' WHERE ') . $pk_quoted . " > ?" . $order;
+				$sql = $self->_src_resume_sql($table);
 				@bind = ($checkpoint);
 			} else {
 				$sql = $initial_sql;
@@ -17425,6 +17727,9 @@ sub _extract_resumable_lob
 	if (!$resume) {
 		$self->logit("FATAL: resume info missing for table $table\n", 0, 1);
 	}
+	if ($resume->{paged}) {
+		return $self->_extract_paged_lob($initial_sql, $table, $cmd_head, $cmd_foot, $s_out, $nn, $tt, $sprep, $stt, $part_name, $proc, $user_type_ref);
+	}
 	my $pk_idx = $resume->{pk_idx};
 	my $base = $resume->{base};
 	my $has_where = $resume->{has_where};
@@ -17478,7 +17783,7 @@ sub _extract_resumable_lob
 				if ($self->_src_is_retryable($diag{err}, $diag{errstr}, $diag{state}, 'connect')) {
 					$self->_src_reconnect($table, 'connect', \%diag, $checkpoint);
 					if (defined $checkpoint) {
-						$sql = $base . ($has_where ? ' AND ' : ' WHERE ') . $pk_quoted . " > ?" . $order;
+						$sql = $self->_src_resume_sql($table);
 						@bind = ($checkpoint);
 					} else {
 						$sql = $initial_sql;
@@ -17667,7 +17972,7 @@ sub _extract_resumable_lob
 			@rows = ();
 			$self->_src_reconnect($table, 'read', \%fetch_diag, $checkpoint);
 			if (defined $checkpoint) {
-				$sql = $base . ($has_where ? ' AND ' : ' WHERE ') . $pk_quoted . " > ?" . $order;
+				$sql = $self->_src_resume_sql($table);
 				@bind = ($checkpoint);
 			} else {
 				$sql = $initial_sql;
@@ -17687,6 +17992,618 @@ sub _extract_resumable_lob
 				@rows = ();
 			}
 			last;
+		}
+		last;
+	}
+
+	$self->close_export_file($self->{cfhout}) if (defined $self->{cfhout});
+	$self->{cfhout} = undef;
+
+	if (!$self->{quiet} && !$self->{debug}) {
+		if (($self->{jobs} <= 1) && ($self->{oracle_copies} <= 1) && ($self->{parallel_tables} <= 1)) {
+			my $end_time = time();
+			my $dt = $end_time - $self->{global_start_time};
+			my $rps = int($self->{current_total_row} / ($dt || 1));
+			print STDERR "\n";
+			print STDERR $self->progress_bar($self->{current_total_row}, $self->{global_rows}, 25, '=', 'total rows', "- ($dt sec., avg: $rps recs/sec).") . "\n";
+		}
+	}
+
+	if (defined $pipe) {
+		my $t_time = time();
+		$pipe->print("TABLE EXPORT ENDED: $table, end: $t_time, rows $total_record\n");
+	}
+
+	return $total_record;
+}
+
+=head2 _extract_paged_bulk
+
+Keyset-paginated bulk path. Each page is an ordered query limited to
+SOURCE_PAGE_SIZE rows (Oracle FETCH FIRST, MSSQL TOP) from the last
+confirmed checkpoint. Only the source transaction is renewed between
+healthy pages; the session stays healthy (formats kept, no
+ORA_INITIAL_COMMAND replay, no PG transaction change). Best-effort
+consistency: each page has its own snapshot. Short pages (<N) end the
+table; full pages open the next one. An exact multiple of N needs a
+final empty query, never treated as an error. Memory stays bounded by
+DATA_LIMIT/BLOB_LIMIT buffers, never by the page.
+
+=cut
+
+sub _extract_paged_bulk
+{
+	my ($self, $initial_sql, $table, $cmd_head, $cmd_foot, $s_out, $nn, $tt, $sprep, $stt, $part_name, $proc, $user_type_ref) = @_;
+
+	my %user_type = ();
+	%user_type = %{$user_type_ref} if ($user_type_ref);
+
+	my $resume = $self->{_src_resume}{$table};
+	if (!$resume || !$resume->{paged}) {
+		$self->logit("FATAL: paged info missing for table $table\n", 0, 1);
+	}
+	my $pk_idx = $resume->{pk_idx};
+	my $page_size = int($resume->{page_size} || 0);
+	if ($page_size <= 0) {
+		$self->logit("FATAL: invalid page size for table $table\n", 0, 1);
+	}
+
+	$0 = "ora2pg - querying table $table";
+	$self->logit("Fetching all data from $table tuples...\n", 1);
+
+	my $start_time = time();
+	my $total_record = 0;
+	my $checkpoint = undef;
+	my $table_start_global = $self->{current_total_row} || 0;
+	my $total_row = $self->{tables}{$table}{table_info}{num_rows};
+
+	if (defined $pipe) {
+		$pipe->print("TABLE EXPORT IN PROGESS: $table, start: $start_time, rows $total_row\n");
+	}
+
+	my $data_limit = $self->{data_limit};
+	if (exists $self->{local_data_limit}{$table}) {
+		$data_limit = $self->{local_data_limit}{$table};
+	}
+	$data_limit = $page_size if (!defined $data_limit || $data_limit <= 0);
+
+	my $need_renew = 1;
+
+	while (1) {
+		my $page_start = time();
+		my $cp_disp = defined $checkpoint ? $checkpoint : 'undef';
+		$self->logit("DEBUG: page start table $table size $page_size checkpoint $cp_disp\n", 1);
+
+		if ($need_renew) {
+			my $renew_done = 0;
+			while (!$renew_done) {
+				my $prev_flag = $self->{_src_retry_active};
+				$self->{_src_retry_active} = 1;
+				my $eval_err = '';
+				eval {
+					$self->_src_page_renew_txn($table, undef);
+					1;
+				} or $eval_err = $@;
+				$self->{_src_retry_active} = $prev_flag;
+				if ($eval_err ne '') {
+					my %diag = $self->_src_diag_from_eval($eval_err, undef, $self->{dbh});
+					if ($diag{errstr} eq '') {
+						my ($e, $es, $st) = $self->_src_capture_handle_error(undef, $self->{dbh});
+						$diag{err} = $e if (defined $e);
+						$diag{errstr} = $es if ($es ne '');
+						$diag{state} = $st if ($st ne '');
+					}
+					if ($self->_src_is_retryable($diag{err}, $diag{errstr}, $diag{state}, 'connect')) {
+						$self->_src_reconnect($table, 'rollover', \%diag, $checkpoint);
+						$renew_done = 1;
+						$need_renew = 0;
+						next;
+					}
+					$self->logit("FATAL: _extract_data() $diag{errstr}\n", 0, 1);
+				}
+				$renew_done = 1;
+			}
+			$need_renew = 0;
+		}
+
+		my $sql = undef;
+		my @bind = ();
+		if (defined $checkpoint) {
+			$sql = $self->_src_resume_sql($table);
+			@bind = ($checkpoint);
+		} else {
+			$sql = $initial_sql;
+			@bind = ();
+		}
+
+		my $sth = undef;
+		my $prep_done = 0;
+		while (!$prep_done) {
+			my $prev_flag = $self->{_src_retry_active};
+			$self->{_src_retry_active} = 1;
+			my $eval_err = '';
+			eval {
+				$sth = $self->_src_prepare_source_sth($table, $sql);
+				if (defined $sth) {
+					if ($#bind >= 0) {
+						$sth->execute(@bind) or $self->logit("FATAL: " . $self->{dbh}->errstr . ", SQL: $sql\n", 0, 1);
+					} else {
+						$sth->execute() or $self->logit("FATAL: " . $self->{dbh}->errstr . ", SQL: $sql\n", 0, 1);
+					}
+				}
+				1;
+			} or $eval_err = $@;
+			$self->{_src_retry_active} = $prev_flag;
+			if ($eval_err ne '') {
+				my %diag = $self->_src_diag_from_eval($eval_err, $sth, $self->{dbh});
+				eval { $sth->finish() if ($sth); };
+				$sth = undef;
+				if ($self->_src_is_retryable($diag{err}, $diag{errstr}, $diag{state}, 'connect')) {
+					$self->_src_reconnect($table, 'connect', \%diag, $checkpoint);
+					if (defined $checkpoint) {
+						$sql = $self->_src_resume_sql($table);
+						@bind = ($checkpoint);
+					} else {
+						$sql = $initial_sql;
+						@bind = ();
+					}
+					next;
+				}
+				$self->logit("FATAL: _extract_data() $diag{errstr}, SQL: $sql\n", 0, 1);
+			}
+			if (!defined $sth) {
+				return 0;
+			}
+			$prep_done = 1;
+		}
+
+		my $page_rows = 0;
+		my $need_resume = 0;
+		my %fetch_diag = ();
+		my $page_eof = 0;
+		while (1) {
+			last if ($page_rows >= $page_size);
+			my $remaining = $page_size - $page_rows;
+			my $fetch_n = $data_limit;
+			$fetch_n = $remaining if ($remaining < $fetch_n);
+			$fetch_n = 1 if ($fetch_n < 1);
+			my $rows = undef;
+			my $eval_err = '';
+			my $prev_flag = $self->{_src_retry_active};
+			$self->{_src_retry_active} = 1;
+			eval {
+				$rows = $sth->fetchall_arrayref(undef, $fetch_n);
+				1;
+			} or $eval_err = $@;
+			my ($ferr, $ferrstr, $fstate) = (undef, '', '');
+			if ($eval_err eq '') {
+				($ferr, $ferrstr, $fstate) = $self->_src_capture_handle_error($sth, $self->{dbh});
+			}
+			$self->{_src_retry_active} = $prev_flag;
+
+			if ($eval_err ne '') {
+				my %diag = $self->_src_diag_from_eval($eval_err, $sth, $self->{dbh});
+				if ($self->_src_is_retryable($diag{err}, $diag{errstr}, $diag{state}, 'read')) {
+					%fetch_diag = %diag;
+					$need_resume = 1;
+					last;
+				}
+				$self->logit("FATAL: _extract_data() $diag{errstr}\n", 0, 1);
+			}
+			if (defined $ferr && $ferr) {
+				my %diag = (err => $ferr, errstr => $ferrstr, state => $fstate);
+				if ($self->_src_is_retryable($ferr, $ferrstr, $fstate, 'read')) {
+					%fetch_diag = %diag;
+					$need_resume = 1;
+					last;
+				}
+				$self->logit("FATAL: _extract_data() $ferrstr\n", 0, 1);
+			}
+			if (!defined $rows || $#$rows < 0) {
+				$page_eof = 1;
+				last;
+			}
+			my $pk_val = $rows->[-1]->[$pk_idx];
+			$pk_val = "$pk_val" if (defined $pk_val);
+			$self->_dump_to_pg($proc, $rows, $table, $cmd_head, $cmd_foot, $s_out, $tt, $sprep, $stt, $start_time, $part_name, $total_record + scalar(@$rows), %user_type);
+			$checkpoint = $pk_val;
+			$total_record += scalar(@$rows);
+			$page_rows += scalar(@$rows);
+			$self->{current_total_row} = $table_start_global + $total_record;
+			$self->logit("DEBUG: number of rows $total_record extracted from table $table\n", 1);
+		}
+
+		eval { $sth->finish() if ($sth); };
+
+		if ($need_resume) {
+			$self->_src_reconnect($table, 'read', \%fetch_diag, $checkpoint);
+			$need_renew = 0;
+			next;
+		}
+
+		my $page_dur = time() - $page_start;
+		my $cp2 = defined $checkpoint ? $checkpoint : 'undef';
+		$self->logit("DEBUG: page end table $table size $page_size checkpoint $cp2 rows $page_rows duration ${page_dur}s\n", 1);
+
+		if ($page_eof) {
+			if ($page_rows < $page_size) {
+				last;
+			}
+			$need_renew = 1;
+			next;
+		}
+		if ($page_rows >= $page_size) {
+			$need_renew = 1;
+			next;
+		}
+		last;
+	}
+
+	$self->close_export_file($self->{cfhout}) if (defined $self->{cfhout});
+	$self->{cfhout} = undef;
+
+	if (!$self->{quiet} && !$self->{debug}) {
+		if (($self->{jobs} <= 1) && ($self->{oracle_copies} <= 1) && ($self->{parallel_tables} <= 1)) {
+			my $end_time = time();
+			my $dt = $end_time - $self->{global_start_time};
+			my $rps = int($self->{current_total_row} / ($dt || 1));
+			print STDERR "\n";
+			print STDERR $self->progress_bar($self->{current_total_row}, $self->{global_rows}, 25, '=', 'total rows', "- ($dt sec., avg: $rps recs/sec).") . "\n";
+		}
+	}
+
+	if (defined $pipe) {
+		my $t_time = time();
+		$pipe->print("TABLE EXPORT ENDED: $table, end: $t_time, rows $total_record\n");
+	}
+
+	return $total_record;
+}
+
+=head2 _extract_paged_lob
+
+Keyset-paginated row-by-row LOB path. All locators are materialized
+before the statement/transaction is closed; the residual buffer is
+flushed and confirmed before a healthy page closes. Never carries
+locators or unconfirmed rows to the next page. Page EOF is not table
+EOF: short pages end the table, full pages open the next one.
+
+=cut
+
+sub _extract_paged_lob
+{
+	my ($self, $initial_sql, $table, $cmd_head, $cmd_foot, $s_out, $nn, $tt, $sprep, $stt, $part_name, $proc, $user_type_ref) = @_;
+
+	my %user_type = ();
+	%user_type = %{$user_type_ref} if ($user_type_ref);
+
+	my $resume = $self->{_src_resume}{$table};
+	if (!$resume || !$resume->{paged}) {
+		$self->logit("FATAL: paged info missing for table $table\n", 0, 1);
+	}
+	my $pk_idx = $resume->{pk_idx};
+	my $page_size = int($resume->{page_size} || 0);
+	if ($page_size <= 0) {
+		$self->logit("FATAL: invalid page size for table $table\n", 0, 1);
+	}
+
+	$0 = "ora2pg - querying table $table";
+	$self->logit("Fetching all data from $table tuples...\n", 1);
+
+	my $start_time = time();
+	my $total_record = 0;
+	my $checkpoint = undef;
+	my $table_start_global = $self->{current_total_row} || 0;
+	my $total_row = $self->{tables}{$table}{table_info}{num_rows};
+
+	if (defined $pipe) {
+		$pipe->print("TABLE EXPORT IN PROGESS: $table, start: $start_time, rows $total_row\n");
+	}
+
+	my $data_limit = $self->{data_limit};
+	if (exists $self->{local_data_limit}{$table}) {
+		$data_limit = $self->{local_data_limit}{$table};
+	}
+	$data_limit = $page_size if (!defined $data_limit || $data_limit < 0);
+
+	my $need_renew = 1;
+
+	while (1) {
+		my $page_start = time();
+		my $cp_disp = defined $checkpoint ? $checkpoint : 'undef';
+		$self->logit("DEBUG: page start table $table size $page_size checkpoint $cp_disp\n", 1);
+
+		if ($need_renew) {
+			my $renew_done = 0;
+			while (!$renew_done) {
+				my $prev_flag = $self->{_src_retry_active};
+				$self->{_src_retry_active} = 1;
+				my $eval_err = '';
+				eval {
+					$self->_src_page_renew_txn($table, undef);
+					1;
+				} or $eval_err = $@;
+				$self->{_src_retry_active} = $prev_flag;
+				if ($eval_err ne '') {
+					my %diag = $self->_src_diag_from_eval($eval_err, undef, $self->{dbh});
+					if ($diag{errstr} eq '') {
+						my ($e, $es, $st) = $self->_src_capture_handle_error(undef, $self->{dbh});
+						$diag{err} = $e if (defined $e);
+						$diag{errstr} = $es if ($es ne '');
+						$diag{state} = $st if ($st ne '');
+					}
+					if ($self->_src_is_retryable($diag{err}, $diag{errstr}, $diag{state}, 'connect')) {
+						$self->_src_reconnect($table, 'rollover', \%diag, $checkpoint);
+						$renew_done = 1;
+						$need_renew = 0;
+						next;
+					}
+					$self->logit("FATAL: _extract_data() $diag{errstr}\n", 0, 1);
+				}
+				$renew_done = 1;
+			}
+			$need_renew = 0;
+		}
+
+		my $sql = undef;
+		my @bind = ();
+		if (defined $checkpoint) {
+			$sql = $self->_src_resume_sql($table);
+			@bind = ($checkpoint);
+		} else {
+			$sql = $initial_sql;
+			@bind = ();
+		}
+
+		my $sth = undef;
+		my $prep_done = 0;
+		while (!$prep_done) {
+			my $prev_flag = $self->{_src_retry_active};
+			$self->{_src_retry_active} = 1;
+			my $eval_err = '';
+			eval {
+				$sth = $self->_src_prepare_source_sth($table, $sql);
+				if (defined $sth) {
+					if ($#bind >= 0) {
+						$sth->execute(@bind) or $self->logit("FATAL: " . $self->{dbh}->errstr . ", SQL: $sql\n", 0, 1);
+					} else {
+						$sth->execute() or $self->logit("FATAL: " . $self->{dbh}->errstr . ", SQL: $sql\n", 0, 1);
+					}
+				}
+				1;
+			} or $eval_err = $@;
+			$self->{_src_retry_active} = $prev_flag;
+			if ($eval_err ne '') {
+				my %diag = $self->_src_diag_from_eval($eval_err, $sth, $self->{dbh});
+				eval { $sth->finish() if ($sth); };
+				$sth = undef;
+				if ($self->_src_is_retryable($diag{err}, $diag{errstr}, $diag{state}, 'connect')) {
+					$self->_src_reconnect($table, 'connect', \%diag, $checkpoint);
+					if (defined $checkpoint) {
+						$sql = $self->_src_resume_sql($table);
+						@bind = ($checkpoint);
+					} else {
+						$sql = $initial_sql;
+						@bind = ();
+					}
+					next;
+				}
+				$self->logit("FATAL: _extract_data() $diag{errstr}, SQL: $sql\n", 0, 1);
+			}
+			if (!defined $sth) {
+				return 0;
+			}
+			$prep_done = 1;
+		}
+
+		my @rows = ();
+		my $page_fetched = 0;
+		my $need_resume = 0;
+		my %fetch_diag = ();
+		my $page_eof = 0;
+
+		while (1) {
+			if ($page_fetched >= $page_size) {
+				last;
+			}
+			my @row = ();
+			my $eval_err = '';
+			my $prev_flag = $self->{_src_retry_active};
+			$self->{_src_retry_active} = 1;
+			eval {
+				@row = $sth->fetchrow_array();
+				1;
+			} or $eval_err = $@;
+			my ($ferr, $ferrstr, $fstate) = (undef, '', '');
+			if ($eval_err eq '') {
+				($ferr, $ferrstr, $fstate) = $self->_src_capture_handle_error($sth, $self->{dbh});
+			}
+			$self->{_src_retry_active} = $prev_flag;
+
+			if ($eval_err ne '') {
+				my %diag = $self->_src_diag_from_eval($eval_err, $sth, $self->{dbh});
+				if ($self->_src_is_retryable($diag{err}, $diag{errstr}, $diag{state}, 'read')) {
+					%fetch_diag = %diag;
+					$need_resume = 1;
+					last;
+				}
+				$self->logit("FATAL: _extract_data() $diag{errstr}\n", 0, 1);
+			}
+			if (defined $ferr && $ferr) {
+				my %diag = (err => $ferr, errstr => $ferrstr, state => $fstate);
+				if ($self->_src_is_retryable($ferr, $ferrstr, $fstate, 'read')) {
+					%fetch_diag = %diag;
+					$need_resume = 1;
+					last;
+				}
+				$self->logit("FATAL: _extract_data() $ferrstr\n", 0, 1);
+			}
+			if ($#row < 0) {
+				$page_eof = 1;
+				last;
+			}
+
+			my $lob_failed = 0;
+			my %lob_diag = ();
+			for (my $j = 0; $j <= $#$stt; $j++) {
+				my $rv = $row[$j];
+				if (defined $rv && $rv =~ /^(?!(?!)\x{100})ARRAY\(0x/ && $stt->[$j] !~ /SDO_GEOMETRY/i) {
+					my $data_type = uc($stt->[$j] || '');
+					$data_type =~ s/\(.*//;
+					$row[$j] = $self->set_custom_type_value($data_type, $user_type{$j}, $row[$j], $tt->[$j], 0);
+				} elsif (defined $stt->[$j] && ($stt->[$j] =~ /LOB|XMLTYPE/) && $row[$j]) {
+					my $lob_content = '';
+					my $offset = 1;
+					my $chunk_size = $self->{lob_chunk_size} || 8192;
+					if (!$self->{lob_chunk_size}) {
+						my $cs_err = '';
+						my $prev2 = $self->{_src_retry_active};
+						$self->{_src_retry_active} = 1;
+						eval {
+							my $cs = $self->{dbh}->ora_lob_chunk_size($row[$j]);
+							$chunk_size = $cs if ($cs);
+							1;
+						} or $cs_err = $@;
+						my ($cerr, $cerrstr, $cstate) = (undef, '', '');
+						if ($cs_err eq '') {
+							($cerr, $cerrstr, $cstate) = $self->_src_capture_handle_error($self->{dbh}, undef);
+						}
+						$self->{_src_retry_active} = $prev2;
+						if ($cs_err ne '') {
+							my %diag = $self->_src_diag_from_eval($cs_err, undef, $self->{dbh});
+							if ($self->_src_is_retryable($diag{err}, $diag{errstr}, $diag{state}, 'read')) {
+								%lob_diag = %diag;
+								$lob_failed = 1;
+								last;
+							}
+							$self->logit("FATAL: _extract_data() $diag{errstr}\n", 0, 1);
+						}
+						if (defined $cerr && $cerr) {
+							if (($cerrstr || '') =~ /ORA-22831/) {
+								$cerr = undef;
+							} else {
+								my %diag = (err => $cerr, errstr => $cerrstr, state => $cstate);
+								if ($self->_src_is_retryable($cerr, $cerrstr, $cstate, 'read')) {
+									%lob_diag = %diag;
+									$lob_failed = 1;
+									last;
+								}
+								$self->logit("FATAL: _extract_data() $cerrstr\n", 0, 1);
+							}
+						}
+					}
+					if (!$lob_failed) {
+						while (1) {
+							my $lobdata = undef;
+							my $lob_err = '';
+							my $prev2 = $self->{_src_retry_active};
+							$self->{_src_retry_active} = 1;
+							eval {
+								$lobdata = $self->{dbh}->ora_lob_read($row[$j], $offset, $chunk_size);
+								1;
+							} or $lob_err = $@;
+							my ($lerr, $lerrstr, $lstate) = (undef, '', '');
+							if ($lob_err eq '') {
+								($lerr, $lerrstr, $lstate) = $self->_src_capture_handle_error($self->{dbh}, undef);
+								if (defined $lerr && $lerr && ($lerrstr || '') =~ /ORA-22831/) {
+									($lerr, $lerrstr, $lstate) = (undef, '', '');
+									$self->{_src_retry_active} = $prev2;
+									last;
+								}
+							}
+							$self->{_src_retry_active} = $prev2;
+							if ($lob_err ne '') {
+								my %diag = $self->_src_diag_from_eval($lob_err, undef, $self->{dbh});
+								if ($self->_src_is_retryable($diag{err}, $diag{errstr}, $diag{state}, 'read')) {
+									%lob_diag = %diag;
+									$lob_failed = 1;
+									last;
+								}
+								$self->logit("FATAL: _extract_data() $diag{errstr}\n", 0, 1);
+							}
+							if (defined $lerr && $lerr) {
+								my %diag = (err => $lerr, errstr => $lerrstr, state => $lstate);
+								if ($self->_src_is_retryable($lerr, $lerrstr, $lstate, 'read')) {
+									%lob_diag = %diag;
+									$lob_failed = 1;
+									last;
+								}
+								$self->logit("FATAL: _extract_data() $lerrstr\n", 0, 1);
+							}
+							last unless (defined $lobdata && length $lobdata);
+							$offset += $chunk_size;
+							$lob_content .= $lobdata;
+						}
+					}
+					if ($lob_failed) {
+						last;
+					}
+					if ($lob_content ne '') {
+						$row[$j] = $lob_content;
+					} else {
+						$row[$j] = undef;
+					}
+				} elsif (defined $stt->[$j] && ($stt->[$j] =~ /LOB/) && !$row[$j]) {
+					$row[$j] = undef;
+				}
+			}
+			if ($lob_failed) {
+				%fetch_diag = %lob_diag;
+				$need_resume = 1;
+				last;
+			}
+
+			push(@rows, [@row]);
+			$page_fetched++;
+
+			if ($#rows == $data_limit) {
+				my $pk_val = $rows[-1]->[$pk_idx];
+				$pk_val = "$pk_val" if (defined $pk_val);
+				$self->_dump_to_pg($proc, \@rows, $table, $cmd_head, $cmd_foot, $s_out, $tt, $sprep, $stt, $start_time, $part_name, $total_record + scalar(@rows), %user_type);
+				$checkpoint = $pk_val;
+				$total_record += scalar(@rows);
+				$self->{current_total_row} = $table_start_global + $total_record;
+				$self->logit("DEBUG: number of rows $total_record extracted from table $table\n", 1);
+				@rows = ();
+			}
+		}
+
+		eval { $sth->finish() if ($sth); };
+
+		if ($need_resume) {
+			@rows = ();
+			$self->_src_reconnect($table, 'read', \%fetch_diag, $checkpoint);
+			$need_renew = 0;
+			next;
+		}
+
+		if ($page_eof || $page_fetched >= $page_size) {
+			if ($#rows >= 0) {
+				my $pk_val = $rows[-1]->[$pk_idx];
+				$pk_val = "$pk_val" if (defined $pk_val);
+				$self->_dump_to_pg($proc, \@rows, $table, $cmd_head, $cmd_foot, $s_out, $tt, $sprep, $stt, $start_time, $part_name, $total_record + scalar(@rows), %user_type);
+				$checkpoint = $pk_val;
+				$total_record += scalar(@rows);
+				$self->{current_total_row} = $table_start_global + $total_record;
+				@rows = ();
+			}
+		}
+
+		my $page_dur = time() - $page_start;
+		my $cp2 = defined $checkpoint ? $checkpoint : 'undef';
+		my $rows_this_page = $page_fetched;
+		$self->logit("DEBUG: page end table $table size $page_size checkpoint $cp2 rows $rows_this_page duration ${page_dur}s\n", 1);
+
+		if ($page_eof) {
+			if ($page_fetched < $page_size) {
+				last;
+			}
+			$need_renew = 1;
+			next;
+		}
+		if ($page_fetched >= $page_size) {
+			$need_renew = 1;
+			next;
 		}
 		last;
 	}
