@@ -76,10 +76,8 @@ non-loopback in `listen_addresses`/`pg_hba.conf`).
 ## 4. Prova (smoke senza scrivere nulla)
 
 ```bash
-export ORA2PG_USER=<user> ORA2PG_PASSWD='<password>'  # se non nel .conf
 podman run --rm --network=host --user root \
   -v /etc/ora2pg/ora2pg_pdm_INSERT.conf:/config/ora2pg.conf:ro,z \
-  -e ORA2PG_USER -e ORA2PG_PASSWD \
   ora2pg:oracle -c /config/ora2pg.conf -t SHOW_VERSION --no_start_scn
 ```
 
@@ -90,14 +88,35 @@ e **senza** `--no_start_scn`):
 ```bash
 podman run --rm --network=host --user root \
   -v /etc/ora2pg/ora2pg_pdm_INSERT_mssql.conf:/config/ora2pg.conf:ro,z \
-  -e ORA2PG_USER -e ORA2PG_PASSWD \
   ora2pg:mssql -c /config/ora2pg.conf -t SHOW_VERSION --mssql
 ```
 
 Regola MSSQL: immagine `ora2pg:mssql` **+** flag `--mssql` sempre **+** DSN
 ODBC (`Opzione B` del `containers/ora2pg.conf.example`).
 
-## 5. Uso reale (equivalente del comando host)
+È possibile passare le variabili d'ambiente per utente/password (`ORA2PG_USER`/`ORA2PG_PASSWD`) con `-e` nel `podman run`
+
+```bash
+export ORA2PG_USER=<user> ORA2PG_PASSWD='<password>'
+# aggiungi al comando podman -e ORA2PG_USER -e ORA2PG_PASSWD \
+```
+
+## 5. Generazione schema (prima volta)
+
+```bash
+podman run --rm --network=host --user root \
+  -v /etc/ora2pg/ora2pg_pdm_INSERT.conf:/config/ora2pg.conf:ro,z \
+  -v /root/out:/work:z \
+  -v /var/log/ora2pg_pdm_container.log:/var/log/ora2pg_pdm.log:z \
+  ora2pg:oracle -c /config/ora2pg.conf -t TABLE --no_start_scn \
+  -o /work/ora_export_schema.sql
+```
+
+```bash
+psql -h 127.0.0.1 -U pdm -f /root/out/ora_export_schema.sql -d pdm
+```
+
+## 6. Uso reale (equivalente del comando host)
 
 Host: `ora2pg -c ... -t INSERT --no_start_scn --pg_dsn "dbi:Pg:..."`
 → container (flock/nice restano sull'host, il nice viene ereditato):
@@ -122,7 +141,7 @@ flock -n /var/lock/ora2pg.lock nice -n 8 podman run --rm --network=host --user r
   --pg_dsn "dbi:Pg:dbname=pdm;host=127.0.0.1;port=5432"
 ```
 
-## 6. Crontab (traduzione 1:1 dei job esistenti)
+## 7. Crontab (traduzione 1:1 dei job esistenti)
 
 ```cron
 #
@@ -150,7 +169,7 @@ Note:
   la risoluzione DNS è quella dell'host, nessuna modifica.
 - Prima di attivare: `touch` dei file di log + verifica §4 per entrambi i `.conf`.
 
-## 7. Troubleshooting rapido
+## 8. Troubleshooting rapido
 
 | Sintomo                                                          | Causa e fix                                                                                                                        |
 | ---------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
