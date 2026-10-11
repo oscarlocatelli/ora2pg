@@ -3247,6 +3247,20 @@ ORDER BY A.COLUMN_ID};
 		}
 	}
 
+	# EOF is normal only without error: never return partial metadata.
+	# Capture code/SQLSTATE/message before finish/cleanup/log.
+	my ($ca_err, $ca_errstr, $ca_state) = (undef, '', '');
+	if ($sth) {
+		$ca_err = $sth->err;
+		$ca_errstr = $sth->errstr || '';
+		$ca_state = eval { $sth->state; } || '';
+	}
+	if (defined $ca_err && $ca_err) {
+		eval { $sth->finish() if ($sth); };
+		$self->logit("FATAL: _column_attributes() $ca_errstr\n", 0, 1);
+	}
+	eval { $sth->finish() if ($sth); };
+
 	return %data;
 }
 

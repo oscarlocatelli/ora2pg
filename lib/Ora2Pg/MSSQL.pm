@@ -2322,21 +2322,42 @@ ORDER BY c.column_id};
 	$sth->execute(@{$self->{query_bind_params}}) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
 
 	my %data = ();
-	while (my $row = $sth->fetch)
-	{
-		next if ($self->{drop_rowversion} && ($row->[4] eq 'rowversion' || $row->[4] eq 'timestamp'));
-                if (!$self->{schema} && $self->{export_schema}) {
-                        $row->[3] = $row->[6] . '.' . $row->[3];
-                }
-		$data{$row->[3]}{$row->[0]}{nullable} = 'N';
-		if ($row->[1]) {
-			$data{$row->[3]}{$row->[0]}{nullable} = 'Y';
+	my $fetch_err = '';
+	eval {
+		while (my $row = $sth->fetch)
+		{
+			next if ($self->{drop_rowversion} && ($row->[4] eq 'rowversion' || $row->[4] eq 'timestamp'));
+	                if (!$self->{schema} && $self->{export_schema}) {
+	                        $row->[3] = $row->[6] . '.' . $row->[3];
+	                }
+			$data{$row->[3]}{$row->[0]}{nullable} = 'N';
+			if ($row->[1]) {
+				$data{$row->[3]}{$row->[0]}{nullable} = 'Y';
+			}
+			$row->[2] =~ s/[\[\]]+//g;
+			$data{$row->[3]}{$row->[0]}{default} = $row->[2];
+			# Store the data type of the column following its position
+			$data{$row->[3]}{data_type}{$row->[5]} = $row->[4];
 		}
-		$row->[2] =~ s/[\[\]]+//g;
-		$data{$row->[3]}{$row->[0]}{default} = $row->[2];
-		# Store the data type of the column following its position
-		$data{$row->[3]}{data_type}{$row->[5]} = $row->[4];
+		1;
+	} or $fetch_err = $@;
+	if ($fetch_err ne '') {
+		eval { $sth->finish() if ($sth); };
+		$self->logit("FATAL: _column_attributes() $fetch_err\n", 0, 1);
 	}
+
+	# EOF is normal only without error: never return partial metadata.
+	my ($ca_err, $ca_errstr, $ca_state) = (undef, '', '');
+	if ($sth) {
+		$ca_err = eval { $sth->err; };
+		$ca_errstr = eval { $sth->errstr; } || '';
+		$ca_state = eval { $sth->state; } || '';
+	}
+	if (defined $ca_err && $ca_err) {
+		eval { $sth->finish() if ($sth); };
+		$self->logit("FATAL: _column_attributes() $ca_errstr\n", 0, 1);
+	}
+	eval { $sth->finish() if ($sth); };
 
 	return %data;
 }

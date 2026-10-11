@@ -1822,6 +1822,27 @@ a value of 0 mean no limit so that all tuples are stored in memory before being
 flushed to disk. In 7.x branch this has been remove and chunk will be set to the
 default: 10000
 
+Direct COPY/INSERT import into PostgreSQL (PG_DSN set, single process with
+JOBS, ORACLE_COPIES and PARALLEL_TABLES all set to 1) has automatic best-effort
+recovery on transient source connection losses. After a recognized Oracle
+(ORA-03113/03114/03135/01012/01033/01034/01089/01090/12514/12528/12541) or MSSQL
+(SQLSTATE 08S01/08003/08006) failure, Ora2Pg waits 60 seconds, reconnects with
+full session initialization and resumes the table from the last block confirmed
+in PostgreSQL, ordered by a single exact-numeric source primary key present in
+the projection (raw source values, placeholder predicate, no interpolation).
+Only confirmed blocks advance the checkpoint and counters; unconfirmed rows and
+LOB locators are discarded, LOB errors never become NULL or truncated content,
+and PostgreSQL failures (including ambiguous confirmations) are never replayed.
+Unsupported cases keep the ordinary export and stop on read error instead of
+resuming: file export, parallelism, REPLACE_QUERY, FDW, DATADIFF, lo_import,
+COPY FREEZE, LOG_ON_ERROR, SELECT_TOP/ROWNUM-style limits, partitioned tables,
+or missing/composite/transformed/non-exact-numeric keys. Reconnects retry
+forever on recognized transient errors and exit non-zero on permanent ones
+(auth, missing objects, invalid data, TLS/certificate, ORA-01555, statement
+timeouts, deadlocks, unknown errors). There is no persistent checkpoint: a
+terminated export is not resumed from logs, and previous data is never deleted
+or reloaded automatically.
+
 =item BLOB_LIMIT
 
 When Ora2Pg detect a table with some BLOB it will automatically reduce the

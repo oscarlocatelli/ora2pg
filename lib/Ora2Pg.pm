@@ -10024,8 +10024,10 @@ sub _get_sql_statements
 			$global_count += $self->{tables}{$table}{table_info}{num_rows};
 
 			# Extract all column information used to determine data export.
-			# This hash will be used in function _howto_get_data()
-			%{$self->{colinfo}} = $self->_column_attributes($table, $self->{schema}, 'TABLE');
+			# This hash will be used in function _howto_get_data().
+			# Repeatable metadata read with source retry; never repeats
+			# destination DELETE/TRUNCATE preparation.
+			%{$self->{colinfo}} = $self->_src_retry_column_attributes($table, $self->{schema});
 
 			# Get the current SCN before getting data for this table
 			if ($self->{cdc_ready})
@@ -12338,6 +12340,121 @@ sub _extract_sequence_info
 }
 
 
+=head2 _src_resume_info
+
+Resolves the single exact-numeric source primary key usable as an
+in-memory resume checkpoint. Returns a hashref with pk_src, pk_idx
+and pk_alias_quoted, or (undef, reason) when resume is unsupported.
+Raw source values are used; destination renames are ignored.
+
+=cut
+
+sub _src_resume_info
+{
+	my ($self, $table, $name, $src_type, $part_name) = @_;
+
+	my $backend = $self->_src_backend();
+	return (undef, 'MySQL non supportato') if ($backend eq 'mysql');
+	return (undef, 'export su file (PG_DSN assente)') if (!$self->{pg_dsn});
+	return (undef, 'tipo ' . ($self->{type} || '?')) if (($self->{type} || '') !~ /^(COPY|INSERT)$/);
+	return (undef, 'parallelismo (JOBS/ORACLE_COPIES/PARALLEL_TABLES)') if (($self->{jobs} || 1) > 1 || ($self->{oracle_copies} || 1) > 1 || ($self->{parallel_tables} || 1) > 1);
+	return (undef, 'LOG_ON_ERROR attivo') if ($self->{log_on_error});
+	return (undef, 'DATADIFF attivo') if ($self->{datadiff});
+	return (undef, 'lo_import attivo') if ($self->{lo_import});
+	return (undef, 'COPY FREEZE attivo') if ($self->{copy_freeze});
+	return (undef, 'FDW attivo') if ($self->{fdw_server} || $self->{oracle_fdw_data_export});
+	return (undef, 'REPLACE_QUERY') if ($self->{replace_query}{"\L$table\E"});
+	return (undef, 'tabella partizionata') if (defined $part_name);
+	return (undef, 'partition_by_reference') if (($self->{partition_by_reference} || '') eq 'duplicate' && exists $self->{partitions_list}{"\L$table\E"});
+	return (undef, 'SELECT_TOP attivo') if ($self->{is_mssql} && $self->{select_top});
+	return (undef, 'oracle_speed attivo') if ($self->{oracle_speed});
+	if (exists $self->{where}{"\L$table\E"} && $self->{where}{"\L$table\E"} =~ /\b(ROWNUM|LIMIT|FETCH\s+FIRST|OFFSET)\b/i) {
+		return (undef, 'limite righe nella WHERE');
+	}
+	if (($self->{global_where} || '') =~ /\b(ROWNUM|LIMIT|FETCH\s+FIRST|OFFSET)\b/i) {
+		return (undef, 'limite righe nella WHERE globale');
+	}
+
+	# Single-column primary key from already loaded metadata (ordered by POSITION in drivers)
+	my @pk_cons = ();
+	if (exists $self->{tables}{$table}{unique_key}) {
+		foreach my $consname (keys %{$self->{tables}{$table}{unique_key}}) {
+			next if (($self->{tables}{$table}{unique_key}->{$consname}{type} || '') ne 'P');
+			push(@pk_cons, $consname);
+		}
+	}
+	return (undef, 'PK assente') if ($#pk_cons < 0);
+	return (undef, 'PK composita/ambigua') if ($#pk_cons > 0);
+	my $consname = $pk_cons[0];
+	my $cols = $self->{tables}{$table}{unique_key}->{$consname}{columns} || [];
+	return (undef, 'PK composita') if ($#$cols != 0);
+	my $pk_src = $cols->[0];
+	return (undef, 'PK assente') if (!defined $pk_src || $pk_src eq '');
+
+	# Projection names (handle legacy scalar or arrayref elements, strip quoting)
+	my @proj_raw = ();
+	my @proj_norm = ();
+	for (my $k = 0; $k <= $#$name; $k++) {
+		my $e = $name->[$k];
+		my $n = ref($e) eq 'ARRAY' ? $e->[0] : $e;
+		$n = '' if (!defined $n);
+		push(@proj_raw, $n);
+		my $c = "$n";
+		$c =~ s/^[\s"`\[\]]+//;
+		$c =~ s/[\s"`\[\]]+$//;
+		push(@proj_norm, $c);
+	}
+	my $pk_idx = -1;
+	for (my $k = 0; $k <= $#proj_norm; $k++) {
+		if (lc($proj_norm[$k]) eq lc($pk_src)) {
+			$pk_idx = $k;
+			last;
+		}
+	}
+	return (undef, 'PK esclusa dalla proiezione') if ($pk_idx < 0);
+
+	# No SQL transformation of the key
+	if (exists $self->{transform_value}{lc($table)} && exists $self->{transform_value}{lc($table)}{lc($pk_src)}) {
+		return (undef, 'PK con TRANSFORM_VALUE');
+	}
+
+	# Exact numeric type from source metadata
+	my $src = '';
+	if (exists $self->{tables}{$table}{column_info}) {
+		foreach my $ck (keys %{$self->{tables}{$table}{column_info}}) {
+			if (lc($ck) eq lc($pk_src)) {
+				$src = $self->{tables}{$table}{column_info}{$ck}[1] || '';
+				last;
+			}
+		}
+	}
+	if (!$src && defined $src_type && $pk_idx <= $#$src_type) {
+		$src = ref($src_type->[$pk_idx]) eq 'ARRAY' ? ($src_type->[$pk_idx][0] || '') : ($src_type->[$pk_idx] || '');
+	}
+	$src = '' if (!defined $src);
+	if ($backend eq 'oracle') {
+		return (undef, 'PK non numerica esatta (' . $src . ')') if ($src =~ /binary_float|binary_double|float|double|real/i);
+		return (undef, 'PK non numerica esatta (' . $src . ')') if ($src !~ /^number(\s|\(|$)/i);
+	} elsif ($backend eq 'mssql') {
+		return (undef, 'PK non numerica esatta (' . $src . ')') if ($src =~ /float|real/i);
+		return (undef, 'PK non numerica esatta (' . $src . ')') if ($src !~ /^(tinyint|smallint|int|bigint|decimal|dec|numeric|money|smallmoney)(\s|\(|$)/i);
+	}
+
+	my $clean = "$pk_src";
+	$clean =~ s/"//g;
+	$clean =~ s/[\[\]]//g;
+	$clean =~ s/^\s+//;
+	$clean =~ s/\s+$//;
+	return (undef, 'PK non valida') if ($clean eq '');
+	my $quoted = '';
+	if ($backend eq 'mssql') {
+		$quoted = "a.[$clean]";
+	} else {
+		$quoted = 'a."' . $clean . '"';
+	}
+	return ({pk_src => $pk_src, pk_idx => $pk_idx, pk_alias_quoted => $quoted}, undef);
+}
+
 =head2 _howto_get_data TABLE
 
 This function implements an Oracle-native data extraction.
@@ -12357,8 +12474,13 @@ sub _howto_get_data
 	{
 		$str = $self->{replace_query}{"\L$table\E"};
 		$self->logit("DEGUG: Query sent to $self->{sgbd_name}: $str\n", 1);
+		delete $self->{_src_resume}{$table};
 		return $str;
 	}
+
+	# Resolve in-memory resume capability before the projection array
+	# is quoted/mutated below. Uses raw source PK values.
+	my ($resume_info, $resume_reason) = $self->_src_resume_info($table, $name, $src_type, $part_name);
 
 	# Fix a problem when the table need to be prefixed by the schema
 	my $realtable = $table;
@@ -12501,9 +12623,9 @@ sub _howto_get_data
 			}
 			elsif ($self->{is_mssql})
 			{
-				#if ($name->[$k] !~ /\[/) {
+				if ($name->[$k] !~ /^\[/) {
 					$name->[$k] = '[' . $name->[$k] . ']';
-				#}
+				}
 			}
 			else
 			{
@@ -12902,6 +13024,30 @@ END;
 			} else {
 				$str .= " ABS(MOD($colpk, $self->{oracle_copies})) = ?";
 			}
+		}
+	}
+
+	# In-memory resume: single ordered query plus a resume template.
+	# The predicate is injected structurally here (no regex rewrite of
+	# arbitrary SQL), with a DBI placeholder. ORDER BY always uses the
+	# source column. Checkpoint values stay raw source strings.
+	if (defined $resume_info) {
+		my $base = $str;
+		my $order = " ORDER BY $resume_info->{pk_alias_quoted}";
+		$str = $base . $order;
+		$self->{_src_resume}{$table} = {
+			pk_src => $resume_info->{pk_src},
+			pk_idx => $resume_info->{pk_idx},
+			pk_alias_quoted => $resume_info->{pk_alias_quoted},
+			base => $base,
+			has_where => ($base =~ / WHERE /i) ? 1 : 0,
+			order => $order,
+		};
+	} else {
+		delete $self->{_src_resume}{$table};
+		if (defined $resume_reason && !$self->{_src_resume_logged}{"\L$table\E"}) {
+			$self->{_src_resume_logged}{"\L$table\E"} = 1;
+			$self->logit("Resume non attivo per tabella $table: $resume_reason\n", 1);
 		}
 	}
 
@@ -16352,6 +16498,12 @@ sub logit
 	}
 	if ($critical)
 	{
+		# Internal protected source-retry context: propagate diagnosis
+		# without global cleanup (logfile/PG handles stay open).
+		# Active only inside source attempts, normal FATAL is unchanged.
+		if ($self->{_src_retry_active}) {
+			die "ORA2PG_SRC_RETRY:" . $message;
+		}
 		if ($self->{debug} < $level)
 		{
 			if (defined $self->{fhlog}) {
@@ -16364,6 +16516,289 @@ sub logit
 		$self->{dbh}->disconnect() if ($self->{dbh});
 		$self->{dbhdest}->disconnect() if ($self->{dbhdest});
 		die "Aborting export...\n";
+	}
+}
+
+=head2 _src_backend
+
+Returns 'oracle', 'mssql' or 'mysql' for source-retry diagnosis.
+
+=cut
+
+sub _src_backend
+{
+	my ($self) = @_;
+
+	return 'mssql' if ($self->{is_mssql});
+	return 'mysql' if ($self->{is_mysql});
+	return 'oracle';
+}
+
+=head2 _src_is_retryable
+
+Conservative allowlist for source connection losses. Inspects only
+errors captured from source operations. Returns 1 when the error is
+a recognized transient connection loss, 0 otherwise. Any doubt means
+no retry. PostgreSQL errors are never retryable here.
+
+=cut
+
+sub _src_is_retryable
+{
+	my ($self, $err, $errstr, $state, $phase) = @_;
+
+	$errstr ||= '';
+	$state ||= '';
+	$phase ||= 'read';
+	my $backend = $self->_src_backend();
+
+	if ($backend eq 'oracle') {
+		my ($code) = $errstr =~ /ORA-(\d+)/i;
+		if (!defined $code || $code eq '') {
+			$code = $err;
+		}
+		$code = int($code || 0);
+		if (grep { $_ == $code } (3113, 3114, 3135, 1012, 1033, 1034, 1089, 1090, 12514, 12528, 12541)) {
+			return 1;
+		}
+		return 0;
+	} elsif ($backend eq 'mssql') {
+		$state = uc($state);
+		$state =~ s/^\s+//;
+		$state =~ s/\s+$//;
+		if (!$state && $errstr =~ /\[([0-9A-Z]{5})\]/i) {
+			$state = uc($1);
+		}
+		if (!$state && $errstr =~ /SQLSTATE\s*[=: ]\s*([0-9A-Z]{5})/i) {
+			$state = uc($1);
+		}
+		if ($state eq '08S01' || $state eq '08003' || $state eq '08006') {
+			return 1;
+		}
+		# 08001 may be a permanent TLS/certificate error: never auto-retry
+		# on read phase. During reconnect, allow login/connection timeout
+		# and TCP refuse/reset only when diagnostics really show them
+		# and no TLS/certificate indication is present.
+		if ($phase eq 'connect') {
+			return 0 if ($errstr =~ /certificate|TLS|SSL/i);
+			if ($errstr =~ /login\s+timeout|connection\s+timeout|timed\s*out|TCP|refused|reset\s+by\s+peer|communication\s+link\s+failure|server\s+not\s+found|host\s+unreachable/i) {
+				if ($state =~ /^(08001|HYT00|HYT01|08S01|08003|08006)$/ || $state eq '') {
+					return 1;
+				}
+			}
+		}
+		return 0;
+	}
+	return 0;
+}
+
+=head2 _src_retry_sleep
+
+Waits 60 seconds between recoverable attempts. The wait is skipped
+when ORA2PG_SRC_RETRY_NO_SLEEP is set or _src_no_sleep is true, so
+regression tests never sleep for real.
+
+=cut
+
+sub _src_retry_sleep
+{
+	my ($self) = @_;
+
+	return if ($ENV{ORA2PG_SRC_RETRY_NO_SLEEP});
+	return if ($self->{_src_no_sleep});
+	sleep 60;
+}
+
+=head2 _src_capture_handle_error
+
+Captures code, SQLSTATE and message from a DBI handle immediately.
+Call it before finish, cleanup, log or any other DBI call.
+
+=cut
+
+sub _src_capture_handle_error
+{
+	my ($self, $handle, $fallback) = @_;
+
+	my ($err, $errstr, $state) = (undef, '', '');
+	if ($handle) {
+		$err = eval { $handle->err; };
+		$errstr = eval { $handle->errstr; } || '';
+		$state = eval { $handle->state; } || '';
+		$errstr = '' if (!defined $errstr);
+		$state = '' if (!defined $state);
+	}
+	if (!defined $err && $fallback) {
+		$err = eval { $fallback->err; };
+		$errstr = eval { $fallback->errstr; } || $errstr;
+		$state = eval { $fallback->state; } || $state;
+		$errstr = '' if (!defined $errstr);
+		$state = '' if (!defined $state);
+	}
+	return ($err, $errstr || '', $state || '');
+}
+
+=head2 _src_diag_from_eval
+
+Builds a diagnosis hash from an eval failure. Distinguishes the
+internal ORA2PG_SRC_RETRY marker (FATAL converted inside a protected
+source attempt) from raw DBI RaiseError strings (MSSQL).
+
+=cut
+
+sub _src_diag_from_eval
+{
+	my ($self, $dollar_at, $sth, $dbh) = @_;
+
+	my %diag = (err => undef, errstr => '', state => '');
+	return %diag if (!defined $dollar_at || $dollar_at eq '');
+
+	if ($dollar_at =~ /^ORA2PG_SRC_RETRY:(.*)$/s) {
+		$diag{errstr} = $1;
+		my ($code) = $diag{errstr} =~ /ORA-(\d+)/i;
+		$diag{err} = defined $code ? int($code) : undef;
+		my ($st) = $diag{errstr} =~ /\[([0-9A-Z]{5})\]/i;
+		$st = $1 if ($diag{errstr} =~ /SQLSTATE\s*[=: ]\s*([0-9A-Z]{5})/i && !defined $st);
+		$diag{state} = defined $st ? uc($st) : '';
+		# Prefer live handle state when the message has none (MSSQL marker)
+		if (!$diag{state}) {
+			my (undef, undef, $hstate) = $self->_src_capture_handle_error($sth, $dbh);
+			$diag{state} = $hstate || '';
+		}
+		return %diag;
+	}
+	$diag{errstr} = "$dollar_at";
+	my ($code) = $diag{errstr} =~ /ORA-(\d+)/i;
+	$diag{err} = defined $code ? int($code) : $DBI::err;
+	my ($st) = $diag{errstr} =~ /\[([0-9A-Z]{5})\]/i;
+	$st = $1 if ($diag{errstr} =~ /SQLSTATE\s*[=: ]\s*([0-9A-Z]{5})/i && !defined $st);
+	if (!defined $st) {
+		my (undef, undef, $hstate) = $self->_src_capture_handle_error($sth, $dbh);
+		$st = $hstate;
+	}
+	$diag{state} = defined $st ? uc($st) : '';
+	return %diag;
+}
+
+=head2 _src_abandon_handle
+
+Safely abandons a broken source statement/handle after the error
+has been captured. Never dies.
+
+=cut
+
+sub _src_abandon_handle
+{
+	my ($self, $sth) = @_;
+
+	eval { $sth->finish() if ($sth); };
+	eval { $self->{dbh}->disconnect() if ($self->{dbh}); };
+	$self->{dbh} = undef;
+}
+
+=head2 _src_reconnect
+
+Waits 60 seconds and reconnects with full driver initialization
+(_db_connection). Retries forever on recognized transient errors,
+exits FATAL on permanent ones. Returns the new handle. Never closes
+logfile or PostgreSQL handles on recoverable attempts.
+
+=cut
+
+sub _src_reconnect
+{
+	my ($self, $table, $phase, $diag, $checkpoint) = @_;
+
+	my $backend = $self->_src_backend();
+	my $attempt = 0;
+	my $cur_diag = $diag;
+
+	while (1) {
+		$attempt++;
+		my $code_disp = defined $cur_diag->{err} ? $cur_diag->{err} : '?';
+		my $state_disp = $cur_diag->{state} || '-';
+		my $msg = $cur_diag->{errstr} || '';
+		$msg =~ s/\s+/ /g;
+		$msg = substr($msg, 0, 300);
+		my $cp_disp = defined $checkpoint ? $checkpoint : 'undef';
+		$self->logit("Source connection lost (backend=$backend table=$table phase=$phase checkpoint=$cp_disp err=$code_disp state=$state_disp): $msg - waiting 60s before retry #$attempt...\n", 0);
+		$self->_src_retry_sleep();
+		$self->logit("Reconnecting to source (backend=$backend table=$table attempt=$attempt)...\n", 0);
+
+		$self->_src_abandon_handle(undef);
+
+		my $prev_flag = $self->{_src_retry_active};
+		$self->{_src_retry_active} = 1;
+		my $new_dbh = undef;
+		my $eval_err = '';
+		eval {
+			$new_dbh = $self->_db_connection();
+			1;
+		} or $eval_err = $@;
+		$self->{_src_retry_active} = $prev_flag;
+
+		if ($eval_err ne '') {
+			my %new_diag = $self->_src_diag_from_eval($eval_err, undef, undef);
+			$new_diag{errstr} = $new_diag{errstr} || "$eval_err";
+			if ($self->_src_is_retryable($new_diag{err}, $new_diag{errstr}, $new_diag{state}, 'connect')) {
+				$cur_diag = \%new_diag;
+				next;
+			}
+			$self->{_src_retry_active} = undef;
+			$self->logit("FATAL: source reconnect failed for table $table: $new_diag{errstr}\n", 0, 1);
+		}
+		if (!defined $new_dbh) {
+			my %new_diag = (err => $DBI::err, errstr => ($DBI::errstr || 'source reconnect returned undef'), state => ($DBI::state || ''));
+			if ($self->_src_is_retryable($new_diag{err}, $new_diag{errstr}, $new_diag{state}, 'connect')) {
+				$cur_diag = \%new_diag;
+				next;
+			}
+			$self->{_src_retry_active} = undef;
+			$self->logit("FATAL: source reconnect failed for table $table: $new_diag{errstr}\n", 0, 1);
+		}
+		$self->{dbh} = $new_dbh;
+		$self->logit("Source reconnected (backend=$backend table=$table attempt=$attempt), resuming from checkpoint $cp_disp...\n", 0);
+		return $new_dbh;
+	}
+}
+
+=head2 _src_retry_column_attributes
+
+Repeatable metadata read with source retry. Preserves list context
+for '%{$self->{colinfo}} = ...'. Does not repeat destination
+DELETE/TRUNCATE preparation.
+
+=cut
+
+sub _src_retry_column_attributes
+{
+	my ($self, $table, $owner) = @_;
+
+	while (1) {
+		my $prev_flag = $self->{_src_retry_active};
+		$self->{_src_retry_active} = 1;
+		my @res = ();
+		my $eval_err = '';
+		eval {
+			@res = $self->_column_attributes($table, $owner, 'TABLE');
+			1;
+		} or $eval_err = $@;
+		$self->{_src_retry_active} = $prev_flag;
+
+		if ($eval_err ne '') {
+			my %diag = $self->_src_diag_from_eval($eval_err, undef, $self->{dbh});
+			if ($self->_src_is_retryable($diag{err}, $diag{errstr}, $diag{state}, 'read')) {
+				$self->_src_reconnect($table, 'read', \%diag, undef);
+				next;
+			}
+			$self->logit("FATAL: _column_attributes() failed for table $table: $diag{errstr}\n", 0, 1);
+		}
+		# _column_attributes uses FATAL on error, so reaching here with
+		# an empty result for a known table is not necessarily an error
+		# (a table may really have no readable columns). Return as-is to
+		# preserve historical behaviour; EOF-with-error is already FATAL
+		# inside the driver implementations.
+		return @res;
 	}
 }
 
@@ -16725,6 +17160,585 @@ sub custom_type_definition
 	return %user_type;
 }
 
+=head2 _src_prepare_source_sth
+
+Prepares the source cursor with the same attributes as the ordinary
+path (RowCacheSize, LOB/LongReadLen, Oracle action). Dies on failure
+(marker inside protected attempts, raw DBI exception for MSSQL).
+Returns undef only for ORA-00942 (table not yet physically created).
+
+=cut
+
+sub _src_prepare_source_sth
+{
+	my ($self, $table, $sql) = @_;
+
+	$self->{dbh}->{RowCacheSize} = int($self->{data_limit} / 10);
+	if (exists $self->{local_data_limit}{$table}) {
+		$self->{dbh}->{RowCacheSize} = $self->{local_data_limit}{$table};
+	}
+
+	my $sth = undef;
+	if ($self->{is_mssql}) {
+		$sth = $self->{dbh}->prepare($sql) or $self->logit("FATAL: " . $self->{dbh}->errstr . ", SQL: $sql\n", 0, 1);
+		$sth->{'LongReadLen'} = $self->{longreadlen};
+	} else {
+		$self->{dbh}->do("CALL DBMS_APPLICATION_INFO.set_action('$table')") or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
+		if (!$self->{use_lob_locator}) {
+			$sth = $self->{dbh}->prepare($sql, {ora_piece_lob => 1, ora_piece_size => $self->{longreadlen}, ora_exe_mode => OCI_STMT_SCROLLABLE_READONLY, ora_check_sql => 1});
+		} else {
+			$sth = $self->{dbh}->prepare($sql, {'ora_auto_lob' => 0, ora_exe_mode => OCI_STMT_SCROLLABLE_READONLY, ora_check_sql => 1});
+		}
+		if (!$sth) {
+			my $es = $self->{dbh}->errstr || '';
+			if ($es =~ /ORA-00942/) {
+				$self->logit("WARNING: table $table is not yet physically created and has no data.\n", 0, 0);
+				return undef;
+			}
+			$self->logit("FATAL: _extract_data() $es\n", 1, 1);
+		}
+		my $es2 = $self->{dbh}->errstr || '';
+		if ($es2 =~ /ORA-00942/) {
+			$self->logit("WARNING: table $table is not yet physically created and has no data.\n", 0, 0);
+			return undef;
+		} elsif ($es2 ne '') {
+			$self->logit("FATAL: _extract_data() $es2\n", 1, 1);
+		}
+	}
+	return $sth;
+}
+
+=head2 _src_resume_sql
+
+Builds the resume SELECT from the stored base (same projection and
+filters) with a placeholder predicate on the source PK.
+
+=cut
+
+sub _src_resume_sql
+{
+	my ($self, $table) = @_;
+
+	my $r = $self->{_src_resume}{$table};
+	return undef if (!$r);
+	my $sql = $r->{base} . ($r->{has_where} ? ' AND ' : ' WHERE ') . $r->{pk_alias_quoted} . " > ?" . $r->{order};
+	return $sql;
+}
+
+=head2 _extract_resumable_bulk
+
+Bulk fetchall path with in-memory checkpoint. The checkpoint advances
+only after successful _dump_to_pg. Source failures discard the
+unconfirmed block and resume from the last checkpoint. PostgreSQL
+failures die via FATAL and are never replayed.
+
+=cut
+
+sub _extract_resumable_bulk
+{
+	my ($self, $initial_sql, $table, $cmd_head, $cmd_foot, $s_out, $nn, $tt, $sprep, $stt, $part_name, $proc, $user_type_ref) = @_;
+
+	my %user_type = ();
+	%user_type = %{$user_type_ref} if ($user_type_ref);
+
+	my $resume = $self->{_src_resume}{$table};
+	if (!$resume) {
+		$self->logit("FATAL: resume info missing for table $table\n", 0, 1);
+	}
+	my $pk_idx = $resume->{pk_idx};
+	my $base = $resume->{base};
+	my $has_where = $resume->{has_where};
+	my $pk_quoted = $resume->{pk_alias_quoted};
+	my $order = $resume->{order};
+
+	$0 = "ora2pg - querying table $table";
+	$self->logit("Fetching all data from $table tuples...\n", 1);
+
+	my $start_time = time();
+	my $total_record = 0;
+	my $checkpoint = undef;
+	my $table_start_global = $self->{current_total_row} || 0;
+	my $total_row = $self->{tables}{$table}{table_info}{num_rows};
+
+	if (defined $pipe) {
+		$pipe->print("TABLE EXPORT IN PROGESS: $table, start: $start_time, rows $total_row\n");
+	}
+
+	my $data_limit = $self->{data_limit};
+	if (exists $self->{local_data_limit}{$table}) {
+		$data_limit = $self->{local_data_limit}{$table};
+	}
+
+	my $sql = $initial_sql;
+	my @bind = ();
+
+	while (1) {
+		my $sth = undef;
+		my $prep_diag = undef;
+		my $prep_failed_retryable = 0;
+		my $prep_done = 0;
+		while (!$prep_done) {
+			my $prev_flag = $self->{_src_retry_active};
+			$self->{_src_retry_active} = 1;
+			my $eval_err = '';
+			eval {
+				$sth = $self->_src_prepare_source_sth($table, $sql);
+				if (defined $sth) {
+					if ($#bind >= 0) {
+						$sth->execute(@bind) or $self->logit("FATAL: " . $self->{dbh}->errstr . ", SQL: $sql\n", 0, 1);
+					} else {
+						$sth->execute() or $self->logit("FATAL: " . $self->{dbh}->errstr . ", SQL: $sql\n", 0, 1);
+					}
+				}
+				1;
+			} or $eval_err = $@;
+			$self->{_src_retry_active} = $prev_flag;
+			if ($eval_err ne '') {
+				my %diag = $self->_src_diag_from_eval($eval_err, $sth, $self->{dbh});
+				eval { $sth->finish() if ($sth); };
+				$sth = undef;
+				if ($self->_src_is_retryable($diag{err}, $diag{errstr}, $diag{state}, 'connect')) {
+					$self->_src_reconnect($table, 'connect', \%diag, $checkpoint);
+					if (defined $checkpoint) {
+						$sql = $base . ($has_where ? ' AND ' : ' WHERE ') . $pk_quoted . " > ?" . $order;
+						@bind = ($checkpoint);
+					} else {
+						$sql = $initial_sql;
+						@bind = ();
+					}
+					next;
+				}
+				$self->logit("FATAL: _extract_data() $diag{errstr}, SQL: $sql\n", 0, 1);
+			}
+			if (!defined $sth) {
+				return 0;
+			}
+			$prep_done = 1;
+		}
+
+		my $need_resume = 0;
+		my %fetch_diag = ();
+		my $eof_ok = 0;
+		while (1) {
+			my $rows = undef;
+			my $eval_err = '';
+			my $prev_flag = $self->{_src_retry_active};
+			$self->{_src_retry_active} = 1;
+			eval {
+				$rows = $sth->fetchall_arrayref(undef, $data_limit);
+				1;
+			} or $eval_err = $@;
+			my ($ferr, $ferrstr, $fstate) = (undef, '', '');
+			if ($eval_err eq '') {
+				($ferr, $ferrstr, $fstate) = $self->_src_capture_handle_error($sth, $self->{dbh});
+			}
+			$self->{_src_retry_active} = $prev_flag;
+
+			if ($eval_err ne '') {
+				my %diag = $self->_src_diag_from_eval($eval_err, $sth, $self->{dbh});
+				if ($self->_src_is_retryable($diag{err}, $diag{errstr}, $diag{state}, 'read')) {
+					%fetch_diag = %diag;
+					$need_resume = 1;
+					last;
+				}
+				$self->logit("FATAL: _extract_data() $diag{errstr}\n", 0, 1);
+			}
+			if (defined $ferr && $ferr) {
+				my %diag = (err => $ferr, errstr => $ferrstr, state => $fstate);
+				if ($self->_src_is_retryable($ferr, $ferrstr, $fstate, 'read')) {
+					%fetch_diag = %diag;
+					$need_resume = 1;
+					last;
+				}
+				$self->logit("FATAL: _extract_data() $ferrstr\n", 0, 1);
+			}
+			if (!defined $rows || $#$rows < 0) {
+				$eof_ok = 1;
+				last;
+			}
+			my $pk_val = $rows->[-1]->[$pk_idx];
+			$pk_val = "$pk_val" if (defined $pk_val);
+			$self->_dump_to_pg($proc, $rows, $table, $cmd_head, $cmd_foot, $s_out, $tt, $sprep, $stt, $start_time, $part_name, $total_record + scalar(@$rows), %user_type);
+			$checkpoint = $pk_val;
+			$total_record += scalar(@$rows);
+			$self->{current_total_row} = $table_start_global + $total_record;
+			$self->logit("DEBUG: number of rows $total_record extracted from table $table\n", 1);
+		}
+
+		eval { $sth->finish() if ($sth); };
+
+		if ($need_resume) {
+			$self->_src_reconnect($table, 'read', \%fetch_diag, $checkpoint);
+			if (defined $checkpoint) {
+				$sql = $base . ($has_where ? ' AND ' : ' WHERE ') . $pk_quoted . " > ?" . $order;
+				@bind = ($checkpoint);
+			} else {
+				$sql = $initial_sql;
+				@bind = ();
+			}
+			next;
+		}
+
+		if ($eof_ok) {
+			last;
+		}
+		last;
+	}
+
+	$self->close_export_file($self->{cfhout}) if (defined $self->{cfhout});
+	$self->{cfhout} = undef;
+
+	if (!$self->{quiet} && !$self->{debug}) {
+		if (($self->{jobs} <= 1) && ($self->{oracle_copies} <= 1) && ($self->{parallel_tables} <= 1)) {
+			my $end_time = time();
+			my $dt = $end_time - $self->{global_start_time};
+			my $rps = int($self->{current_total_row} / ($dt || 1));
+			print STDERR "\n";
+			print STDERR $self->progress_bar($self->{current_total_row}, $self->{global_rows}, 25, '=', 'total rows', "- ($dt sec., avg: $rps recs/sec).") . "\n";
+		}
+	}
+
+	if (defined $pipe) {
+		my $t_time = time();
+		$pipe->print("TABLE EXPORT ENDED: $table, end: $t_time, rows $total_record\n");
+	}
+
+	return $total_record;
+}
+
+=head2 _extract_resumable_lob
+
+Row-by-row LOB path with in-memory checkpoint. A LOB error never
+becomes NULL or truncated content: the unconfirmed block and locators
+are discarded and the read resumes from the checkpoint.
+
+=cut
+
+sub _extract_resumable_lob
+{
+	my ($self, $initial_sql, $table, $cmd_head, $cmd_foot, $s_out, $nn, $tt, $sprep, $stt, $part_name, $proc, $user_type_ref) = @_;
+
+	my %user_type = ();
+	%user_type = %{$user_type_ref} if ($user_type_ref);
+
+	my $resume = $self->{_src_resume}{$table};
+	if (!$resume) {
+		$self->logit("FATAL: resume info missing for table $table\n", 0, 1);
+	}
+	my $pk_idx = $resume->{pk_idx};
+	my $base = $resume->{base};
+	my $has_where = $resume->{has_where};
+	my $pk_quoted = $resume->{pk_alias_quoted};
+	my $order = $resume->{order};
+
+	$0 = "ora2pg - querying table $table";
+	$self->logit("Fetching all data from $table tuples...\n", 1);
+
+	my $start_time = time();
+	my $total_record = 0;
+	my $checkpoint = undef;
+	my $table_start_global = $self->{current_total_row} || 0;
+	my $total_row = $self->{tables}{$table}{table_info}{num_rows};
+
+	if (defined $pipe) {
+		$pipe->print("TABLE EXPORT IN PROGESS: $table, start: $start_time, rows $total_row\n");
+	}
+
+	my $data_limit = $self->{data_limit};
+	if (exists $self->{local_data_limit}{$table}) {
+		$data_limit = $self->{local_data_limit}{$table};
+	}
+
+	my $sql = $initial_sql;
+	my @bind = ();
+
+	while (1) {
+		my $sth = undef;
+		my $prep_done = 0;
+		while (!$prep_done) {
+			my $prev_flag = $self->{_src_retry_active};
+			$self->{_src_retry_active} = 1;
+			my $eval_err = '';
+			eval {
+				$sth = $self->_src_prepare_source_sth($table, $sql);
+				if (defined $sth) {
+					if ($#bind >= 0) {
+						$sth->execute(@bind) or $self->logit("FATAL: " . $self->{dbh}->errstr . ", SQL: $sql\n", 0, 1);
+					} else {
+						$sth->execute() or $self->logit("FATAL: " . $self->{dbh}->errstr . ", SQL: $sql\n", 0, 1);
+					}
+				}
+				1;
+			} or $eval_err = $@;
+			$self->{_src_retry_active} = $prev_flag;
+			if ($eval_err ne '') {
+				my %diag = $self->_src_diag_from_eval($eval_err, $sth, $self->{dbh});
+				eval { $sth->finish() if ($sth); };
+				$sth = undef;
+				if ($self->_src_is_retryable($diag{err}, $diag{errstr}, $diag{state}, 'connect')) {
+					$self->_src_reconnect($table, 'connect', \%diag, $checkpoint);
+					if (defined $checkpoint) {
+						$sql = $base . ($has_where ? ' AND ' : ' WHERE ') . $pk_quoted . " > ?" . $order;
+						@bind = ($checkpoint);
+					} else {
+						$sql = $initial_sql;
+						@bind = ();
+					}
+					next;
+				}
+				$self->logit("FATAL: _extract_data() $diag{errstr}, SQL: $sql\n", 0, 1);
+			}
+			if (!defined $sth) {
+				return 0;
+			}
+			$prep_done = 1;
+		}
+
+		my @rows = ();
+		my $need_resume = 0;
+		my %fetch_diag = ();
+		my $eof_ok = 0;
+
+		while (1) {
+			my @row = ();
+			my $eval_err = '';
+			my $prev_flag = $self->{_src_retry_active};
+			$self->{_src_retry_active} = 1;
+			eval {
+				@row = $sth->fetchrow_array();
+				1;
+			} or $eval_err = $@;
+			my ($ferr, $ferrstr, $fstate) = (undef, '', '');
+			if ($eval_err eq '') {
+				($ferr, $ferrstr, $fstate) = $self->_src_capture_handle_error($sth, $self->{dbh});
+			}
+			$self->{_src_retry_active} = $prev_flag;
+
+			if ($eval_err ne '') {
+				my %diag = $self->_src_diag_from_eval($eval_err, $sth, $self->{dbh});
+				if ($self->_src_is_retryable($diag{err}, $diag{errstr}, $diag{state}, 'read')) {
+					%fetch_diag = %diag;
+					$need_resume = 1;
+					last;
+				}
+				$self->logit("FATAL: _extract_data() $diag{errstr}\n", 0, 1);
+			}
+			if (defined $ferr && $ferr) {
+				my %diag = (err => $ferr, errstr => $ferrstr, state => $fstate);
+				if ($self->_src_is_retryable($ferr, $ferrstr, $fstate, 'read')) {
+					%fetch_diag = %diag;
+					$need_resume = 1;
+					last;
+				}
+				$self->logit("FATAL: _extract_data() $ferrstr\n", 0, 1);
+			}
+			if ($#row < 0) {
+				$eof_ok = 1;
+				last;
+			}
+
+			my $lob_failed = 0;
+			my %lob_diag = ();
+			for (my $j = 0; $j <= $#$stt; $j++) {
+				my $rv = $row[$j];
+				if (defined $rv && $rv =~ /^(?!(?!)\x{100})ARRAY\(0x/ && $stt->[$j] !~ /SDO_GEOMETRY/i) {
+					my $data_type = uc($stt->[$j] || '');
+					$data_type =~ s/\(.*//;
+					$row[$j] = $self->set_custom_type_value($data_type, $user_type{$j}, $row[$j], $tt->[$j], 0);
+				} elsif (defined $stt->[$j] && ($stt->[$j] =~ /LOB|XMLTYPE/) && $row[$j]) {
+					my $lob_content = '';
+					my $offset = 1;
+					my $chunk_size = $self->{lob_chunk_size} || 8192;
+					if (!$self->{lob_chunk_size}) {
+						my $cs_err = '';
+						my $prev2 = $self->{_src_retry_active};
+						$self->{_src_retry_active} = 1;
+						eval {
+							my $cs = $self->{dbh}->ora_lob_chunk_size($row[$j]);
+							$chunk_size = $cs if ($cs);
+							1;
+						} or $cs_err = $@;
+						my ($cerr, $cerrstr, $cstate) = (undef, '', '');
+						if ($cs_err eq '') {
+							($cerr, $cerrstr, $cstate) = $self->_src_capture_handle_error($self->{dbh}, undef);
+						}
+						$self->{_src_retry_active} = $prev2;
+						if ($cs_err ne '') {
+							my %diag = $self->_src_diag_from_eval($cs_err, undef, $self->{dbh});
+							if ($self->_src_is_retryable($diag{err}, $diag{errstr}, $diag{state}, 'read')) {
+								%lob_diag = %diag;
+								$lob_failed = 1;
+								last;
+							}
+							$self->logit("FATAL: _extract_data() $diag{errstr}\n", 0, 1);
+						}
+						if (defined $cerr && $cerr) {
+							if (($cerrstr || '') =~ /ORA-22831/) {
+								$cerr = undef;
+							} else {
+								my %diag = (err => $cerr, errstr => $cerrstr, state => $cstate);
+								if ($self->_src_is_retryable($cerr, $cerrstr, $cstate, 'read')) {
+									%lob_diag = %diag;
+									$lob_failed = 1;
+									last;
+								}
+								$self->logit("FATAL: _extract_data() $cerrstr\n", 0, 1);
+							}
+						}
+					}
+					if (!$lob_failed) {
+						while (1) {
+							my $lobdata = undef;
+							my $lob_err = '';
+							my $prev2 = $self->{_src_retry_active};
+							$self->{_src_retry_active} = 1;
+							eval {
+								$lobdata = $self->{dbh}->ora_lob_read($row[$j], $offset, $chunk_size);
+								1;
+							} or $lob_err = $@;
+							my ($lerr, $lerrstr, $lstate) = (undef, '', '');
+							if ($lob_err eq '') {
+								($lerr, $lerrstr, $lstate) = $self->_src_capture_handle_error($self->{dbh}, undef);
+								if (defined $lerr && $lerr && ($lerrstr || '') =~ /ORA-22831/) {
+									($lerr, $lerrstr, $lstate) = (undef, '', '');
+									$self->{_src_retry_active} = $prev2;
+									last;
+								}
+							}
+							$self->{_src_retry_active} = $prev2;
+							if ($lob_err ne '') {
+								my %diag = $self->_src_diag_from_eval($lob_err, undef, $self->{dbh});
+								if ($self->_src_is_retryable($diag{err}, $diag{errstr}, $diag{state}, 'read')) {
+									%lob_diag = %diag;
+									$lob_failed = 1;
+									last;
+								}
+								$self->logit("FATAL: _extract_data() $diag{errstr}\n", 0, 1);
+							}
+							if (defined $lerr && $lerr) {
+								my %diag = (err => $lerr, errstr => $lerrstr, state => $lstate);
+								if ($self->_src_is_retryable($lerr, $lerrstr, $lstate, 'read')) {
+									%lob_diag = %diag;
+									$lob_failed = 1;
+									last;
+								}
+								$self->logit("FATAL: _extract_data() $lerrstr\n", 0, 1);
+							}
+							last unless (defined $lobdata && length $lobdata);
+							$offset += $chunk_size;
+							$lob_content .= $lobdata;
+						}
+					}
+					if ($lob_failed) {
+						last;
+					}
+					if ($lob_content ne '') {
+						$row[$j] = $lob_content;
+					} else {
+						$row[$j] = undef;
+					}
+				} elsif (defined $stt->[$j] && ($stt->[$j] =~ /LOB/) && !$row[$j]) {
+					$row[$j] = undef;
+				}
+			}
+			if ($lob_failed) {
+				%fetch_diag = %lob_diag;
+				$need_resume = 1;
+				last;
+			}
+
+			push(@rows, [@row]);
+
+			if ($#rows == $data_limit) {
+				my $pk_val = $rows[-1]->[$pk_idx];
+				$pk_val = "$pk_val" if (defined $pk_val);
+				$self->_dump_to_pg($proc, \@rows, $table, $cmd_head, $cmd_foot, $s_out, $tt, $sprep, $stt, $start_time, $part_name, $total_record + scalar(@rows), %user_type);
+				$checkpoint = $pk_val;
+				$total_record += scalar(@rows);
+				$self->{current_total_row} = $table_start_global + $total_record;
+				$self->logit("DEBUG: number of rows $total_record extracted from table $table\n", 1);
+				@rows = ();
+			}
+		}
+
+		eval { $sth->finish() if ($sth); };
+
+		if ($need_resume) {
+			@rows = ();
+			$self->_src_reconnect($table, 'read', \%fetch_diag, $checkpoint);
+			if (defined $checkpoint) {
+				$sql = $base . ($has_where ? ' AND ' : ' WHERE ') . $pk_quoted . " > ?" . $order;
+				@bind = ($checkpoint);
+			} else {
+				$sql = $initial_sql;
+				@bind = ();
+			}
+			next;
+		}
+
+		if ($eof_ok) {
+			if ($#rows >= 0) {
+				my $pk_val = $rows[-1]->[$pk_idx];
+				$pk_val = "$pk_val" if (defined $pk_val);
+				$self->_dump_to_pg($proc, \@rows, $table, $cmd_head, $cmd_foot, $s_out, $tt, $sprep, $stt, $start_time, $part_name, $total_record + scalar(@rows), %user_type);
+				$checkpoint = $pk_val;
+				$total_record += scalar(@rows);
+				$self->{current_total_row} = $table_start_global + $total_record;
+				@rows = ();
+			}
+			last;
+		}
+		last;
+	}
+
+	$self->close_export_file($self->{cfhout}) if (defined $self->{cfhout});
+	$self->{cfhout} = undef;
+
+	if (!$self->{quiet} && !$self->{debug}) {
+		if (($self->{jobs} <= 1) && ($self->{oracle_copies} <= 1) && ($self->{parallel_tables} <= 1)) {
+			my $end_time = time();
+			my $dt = $end_time - $self->{global_start_time};
+			my $rps = int($self->{current_total_row} / ($dt || 1));
+			print STDERR "\n";
+			print STDERR $self->progress_bar($self->{current_total_row}, $self->{global_rows}, 25, '=', 'total rows', "- ($dt sec., avg: $rps recs/sec).") . "\n";
+		}
+	}
+
+	if (defined $pipe) {
+		my $t_time = time();
+		$pipe->print("TABLE EXPORT ENDED: $table, end: $t_time, rows $total_record\n");
+	}
+
+	return $total_record;
+}
+
+=head2 _extract_data_resumable
+
+Dispatcher for the single-process direct-PG path with checkpoint.
+
+=cut
+
+sub _extract_data_resumable
+{
+	my ($self, $query, $table, $cmd_head, $cmd_foot, $s_out, $nn, $tt, $sprep, $stt, $part_name, $proc, $user_type_ref, $has_custom_ref) = @_;
+
+	my @has_custom_type = ();
+	@has_custom_type = @{$has_custom_ref} if ($has_custom_ref);
+
+	my $data_limit = $self->{data_limit};
+	if (exists $self->{local_data_limit}{$table}) {
+		$data_limit = $self->{local_data_limit}{$table};
+	}
+	my $has_blob = 0;
+	$has_blob = 1 if (grep(/LOB|XMLTYPE/, @$stt));
+
+	if (($#has_custom_type == -1) && (!$has_blob || !$self->{use_lob_locator})) {
+		return $self->_extract_resumable_bulk($query, $table, $cmd_head, $cmd_foot, $s_out, $nn, $tt, $sprep, $stt, $part_name, $proc, $user_type_ref);
+	} else {
+		return $self->_extract_resumable_lob($query, $table, $cmd_head, $cmd_foot, $s_out, $nn, $tt, $sprep, $stt, $part_name, $proc, $user_type_ref);
+	}
+}
+
 sub _extract_data
 {
 	my ($self, $query, $table, $cmd_head, $cmd_foot, $s_out, $nn, $tt, $sprep, $stt, $part_name, $proc) = @_;
@@ -16773,6 +17787,13 @@ sub _extract_data
 				%{ $user_type{$idx} } = %{ $self->{user_type}{$stt->[$idx]} };
 			}
 		}
+	}
+
+	# Single-process direct-PG path with in-memory checkpoint. The retry
+	# stays inside this table/cursor and never recalls _export_table_data
+	# or _dump_table, so DELETE/TRUNCATE are not repeated.
+	if (exists $self->{_src_resume}{$table} && !defined $part_name && !defined $proc && ($self->{jobs} || 1) <= 1 && ($self->{oracle_copies} || 1) <= 1 && ($self->{parallel_tables} || 1) <= 1 && $self->{pg_dsn} && (($self->{type} || '') =~ /^(COPY|INSERT)$/) && !$self->{is_mysql} && !$self->{replace_query}{"\L$table\E"}) {
+		return $self->_extract_data_resumable($query, $table, $cmd_head, $cmd_foot, $s_out, $nn, $tt, $sprep, $stt, $part_name, $proc, \%user_type, \@has_custom_type);
 	}
 
 	if ( ($self->{parallel_tables} > 1) || (($self->{oracle_copies} > 1) && $self->{defined_pk}{"\L$table\E"}) )
@@ -16903,19 +17924,26 @@ sub _extract_data
 		# With rows that not have custom type nor blob unless the user doesn't want to use lob locator
 		if (($#has_custom_type == -1) && (!$has_blob || !$self->{use_lob_locator}))
 		{
-			while ( my $rows = $sth->fetchall_arrayref(undef,$data_limit))
+			while (1)
 			{
-				if ( ($self->{parallel_tables} > 1) || (($self->{oracle_copies} > 1) && $self->{defined_pk}{"\L$table\E"}) )
-				{
-					if ($dbh->errstr)
-					{
-						$self->logit("ERROR: " . $dbh->errstr . "\n", 0, 0);
-						last;
-					}
+				my $rows = undef;
+				my $fetch_err = '';
+				eval {
+					$rows = $sth->fetchall_arrayref(undef, $data_limit);
+					1;
+				} or $fetch_err = $@;
+				if ($fetch_err ne '') {
+					$self->logit("FATAL: _extract_data() $fetch_err\n", 0, 1);
 				}
-				elsif ( $self->{dbh}->errstr )
-				{
-					$self->logit("ERROR: " . $self->{dbh}->errstr . "\n", 0, 0);
+				my $check_dbh = $self->{dbh};
+				if (($self->{parallel_tables} > 1) || (($self->{oracle_copies} > 1) && $self->{defined_pk}{"\L$table\E"})) {
+					$check_dbh = $dbh;
+				}
+				my ($ferr, $ferrstr, $fstate) = $self->_src_capture_handle_error($sth, $check_dbh);
+				if (defined $ferr && $ferr) {
+					$self->logit("FATAL: _extract_data() $ferrstr\n", 0, 1);
+				}
+				if (!defined $rows || $#$rows < 0) {
 					last;
 				}
 
@@ -16957,19 +17985,26 @@ sub _extract_data
 		else
 		{
 			my @rows = ();
-			while ( my @row = $sth->fetchrow_array())
+			while (1)
 			{
-				if ( ($self->{parallel_tables} > 1) || (($self->{oracle_copies} > 1) && $self->{defined_pk}{"\L$table\E"}) )
-				{
-					if ($dbh->errstr)
-					{
-						$self->logit("ERROR: " . $dbh->errstr . "\n", 0, 0);
-						last;
-					}
+				my @row = ();
+				my $fetch_err = '';
+				eval {
+					@row = $sth->fetchrow_array();
+					1;
+				} or $fetch_err = $@;
+				if ($fetch_err ne '') {
+					$self->logit("FATAL: _extract_data() $fetch_err\n", 0, 1);
 				}
-				elsif ( $self->{dbh}->errstr )
-				{
-					$self->logit("ERROR: " . $self->{dbh}->errstr . "\n", 0, 0);
+				my $check_dbh2 = $self->{dbh};
+				if (($self->{parallel_tables} > 1) || (($self->{oracle_copies} > 1) && $self->{defined_pk}{"\L$table\E"})) {
+					$check_dbh2 = $dbh;
+				}
+				my ($ferr2, $ferrstr2, $fstate2) = $self->_src_capture_handle_error($sth, $check_dbh2);
+				if (defined $ferr2 && $ferr2) {
+					$self->logit("FATAL: _extract_data() $ferrstr2\n", 0, 1);
+				}
+				if ($#row < 0) {
 					last;
 				}
 
@@ -16992,13 +18027,29 @@ sub _extract_data
 						if ( ($self->{parallel_tables} > 1) || (($self->{oracle_copies} > 1) && $self->{defined_pk}{"\L$table\E"}) )
 						{
 							# Get chunk size
-							my $chunk_size = $self->{lob_chunk_size} || $dbh->ora_lob_chunk_size($row[$j]) || 8192;
+							my $chunk_size = $self->{lob_chunk_size} || 8192;
+							eval {
+								my $cs = $dbh->ora_lob_chunk_size($row[$j]);
+								$chunk_size = $cs if ($cs);
+								1;
+							};
 							while (1)
 							{
-								my $lobdata = $dbh->ora_lob_read($row[$j], $offset, $chunk_size );
-								if ($dbh->errstr) {
-									$self->logit("ERROR: " . $dbh->errstr . "\n", 0, 0) if ($dbh->errstr !~ /ORA-22831/);
-									last;
+								my $lobdata = undef;
+								my $lob_eval_err = '';
+								eval {
+									$lobdata = $dbh->ora_lob_read($row[$j], $offset, $chunk_size);
+									1;
+								} or $lob_eval_err = $@;
+								if ($lob_eval_err ne '') {
+									$self->logit("FATAL: _extract_data() $lob_eval_err\n", 0, 1);
+								}
+								my ($lerr, $lerrstr, $lstate) = $self->_src_capture_handle_error($dbh, undef);
+								if (defined $lerr && $lerr) {
+									if (($lerrstr || '') =~ /ORA-22831/) {
+										last;
+									}
+									$self->logit("FATAL: _extract_data() $lerrstr\n", 0, 1);
 								}
 								last unless (defined $lobdata && length $lobdata);
 								$offset += $chunk_size;
@@ -17008,14 +18059,29 @@ sub _extract_data
 						else
 						{
 							# Get chunk size
-							my $chunk_size = $self->{lob_chunk_size} || $self->{dbh}->ora_lob_chunk_size($row[$j]) || 8192;
+							my $chunk_size = $self->{lob_chunk_size} || 8192;
+							eval {
+								my $cs = $self->{dbh}->ora_lob_chunk_size($row[$j]);
+								$chunk_size = $cs if ($cs);
+								1;
+							};
 							while (1)
 							{
-								my $lobdata = $self->{dbh}->ora_lob_read($row[$j], $offset, $chunk_size );
-								if ($self->{dbh}->errstr)
-								{
-									$self->logit("ERROR: " . $self->{dbh}->errstr . "\n", 0, 0) if ($self->{dbh}->errstr !~ /ORA-22831/);
-									last;
+								my $lobdata = undef;
+								my $lob_eval_err = '';
+								eval {
+									$lobdata = $self->{dbh}->ora_lob_read($row[$j], $offset, $chunk_size);
+									1;
+								} or $lob_eval_err = $@;
+								if ($lob_eval_err ne '') {
+									$self->logit("FATAL: _extract_data() $lob_eval_err\n", 0, 1);
+								}
+								my ($lerr2, $lerrstr2, $lstate2) = $self->_src_capture_handle_error($self->{dbh}, undef);
+								if (defined $lerr2 && $lerr2) {
+									if (($lerrstr2 || '') =~ /ORA-22831/) {
+										last;
+									}
+									$self->logit("FATAL: _extract_data() $lerrstr2\n", 0, 1);
 								}
 								last unless (defined $lobdata && length $lobdata);
 								$offset += $chunk_size;
@@ -17524,6 +18590,10 @@ sub _dump_to_pg
 		}
 		unlink($tempfiles[0]->[1]) if (-e $tempfiles[0]->[1]);
 	}
+
+	# Explicit success for checkpoint handling. SQL and transactions
+	# are unchanged; PostgreSQL failures already die via FATAL above.
+	return 1;
 }
 
 
