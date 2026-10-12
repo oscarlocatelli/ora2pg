@@ -1540,6 +1540,14 @@ sub _init
 		!exists $self->{source_page_size} ? 1 : 0
 	);
 	$self->{blob_limit} ||= 0;
+	$self->{blob_check_threshold} = 20 if (!exists $self->{blob_check_threshold});
+	if (defined $self->{blob_check_threshold} && "$self->{blob_check_threshold}" =~ /^\s*$/) {
+		$self->{blob_check_threshold} = 20;
+	}
+	if (defined $self->{blob_check_threshold} && "$self->{blob_check_threshold}" !~ /^\s*\d+\s*$/) {
+		$self->logit("FATAL: invalid BLOB_CHECK_THRESHOLD value '$self->{blob_check_threshold}', must be a non-negative integer, 0 disables the empty-LOB probe.\n", 0, 1);
+	}
+	$self->{blob_check_threshold} = int($self->{blob_check_threshold}) if (defined $self->{blob_check_threshold});
 	$self->{clob_as_blob} ||= 0;
 	$self->{disable_partition} ||= 0;
 	$self->{parallel_tables} ||= 0;
@@ -12626,6 +12634,10 @@ sub _howto_get_data
 	}
 	else
 	{
+		# LOB-typed columns candidate to the reduced BLOB chunk. The
+		# empty-LOB probe below decides once per table, after the
+		# projection is built, if the reduction really applies.
+		my @blob_probe_cols = ();
 		for my $k (0 .. $#{$name})
 		{
 			my $realcolname = $name->[$k];
@@ -12827,6 +12839,21 @@ sub _howto_get_data
 			if ( ($type->[$k] =~ /bytea/i && $self->{enable_blob_export}) ||
 				($self->{clob_as_blob} && $src_type->[$k] =~ /CLOB/i) )
 			{
+				# Collect once, decide after the projection: the
+				# empty-LOB probe may keep the full DATA_LIMIT chunk
+				# when the table holds no populated LOB values.
+				push(@blob_probe_cols, { name => $name->[$k], src => $src_type->[$k] });
+			}
+		}
+		$str =~ s/,$//;
+		if (@blob_probe_cols)
+		{
+			my $apply_reduction = 1;
+			if (!$self->{blob_limit}) {
+				my $populated = $self->_table_has_populated_lobs($table, $realtable, \@blob_probe_cols);
+				$apply_reduction = 0 if (defined $populated && !$populated);
+			}
+			if ($apply_reduction) {
 				if ($self->{data_limit} >= 1000)
 				{
 					$self->{local_data_limit}{$table} = int($self->{data_limit}/10);
@@ -12841,7 +12868,6 @@ sub _howto_get_data
 				$self->{local_data_limit}{$table} = $self->{blob_limit} if ($self->{blob_limit});
 			}
 		}
-		$str =~ s/,$//;
 	}
 
 	# If we have a BFILE that might be exported as text we need to create a function
@@ -16913,6 +16939,108 @@ sub _validate_source_page_size
 		$self->logit("FATAL: invalid SOURCE_PAGE_SIZE value '$v', must be a non-negative integer, 0 disables pagination.\n", 0, 1);
 	}
 	return int($v);
+}
+
+=head2 _blob_check_threshold
+
+Returns the validated BLOB_CHECK_THRESHOLD. Defaults to 20 when the
+object bypassed _init (tests). An explicit 0 disables the empty-LOB
+probe and preserves the previous behavior (reduced chunk on types).
+
+=cut
+
+sub _blob_check_threshold
+{
+	my ($self) = @_;
+
+	return 20 if (!exists $self->{blob_check_threshold} || !defined $self->{blob_check_threshold});
+	my $v = "$self->{blob_check_threshold}";
+	$v =~ s/^\s+//;
+	$v =~ s/\s+$//;
+	return 20 if ($v eq '');
+	return int($v) if ($v =~ /^\d+$/);
+	return 20;
+}
+
+=head2 _table_has_populated_lobs
+
+Cheap read-only probe used to decide if a table with LOB-typed columns
+really holds LOB content. Counts populated LOB values up to
+BLOB_CHECK_THRESHOLD + 1 and returns 1 when the count exceeds the
+threshold (treat as BLOB table, reduced chunk), 0 when at or below
+(empty-ish table, full DATA_LIMIT chunk is kept) and undef when it
+cannot be determined (no source connection, non-Oracle source or
+probe error: caller must keep the legacy reduced chunk).
+
+The probe never dies: any failure is logged at debug level and yields
+undef. Only IS NOT NULL is evaluated when DBMS_LOB cannot be used,
+which is conservative (EMPTY_BLOB counts as populated). Results are
+cached per table.
+
+=cut
+
+sub _table_has_populated_lobs
+{
+	my ($self, $table, $realtable, $lob_cols) = @_;
+
+	return undef if (!$lob_cols || !@$lob_cols);
+	return undef if ($self->{is_mssql} || $self->{is_mysql});
+	my $th = $self->_blob_check_threshold();
+	return undef if (!defined $th || $th == 0);
+	return $self->{_blob_probe_cache}{$table} if (exists $self->{_blob_probe_cache}{$table});
+	return undef if (!$self->{dbh});
+
+	my $ping_ok = 0;
+	eval { $ping_ok = $self->{dbh}->ping(); 1; } or $ping_ok = 0;
+	if (!$ping_ok) {
+		return undef;
+	}
+
+	my $use_getlength = $self->{has_dbms_log_execute_privilege} ? 1 : 0;
+	my @conds = ();
+	foreach my $c (@$lob_cols) {
+		my $col = $c->{name} || '';
+		next if ($col eq '');
+		if ($use_getlength) {
+			push(@conds, "($col IS NOT NULL AND DBMS_LOB.GETLENGTH($col) > 0)");
+		} else {
+			push(@conds, "($col IS NOT NULL)");
+		}
+	}
+	return undef if (!@conds);
+
+	my $limit = $th + 1;
+	my $where = join(' OR ', @conds);
+	my $sql = "SELECT COUNT(*) FROM (SELECT 1 FROM $realtable WHERE ($where) AND ROWNUM <= $limit)";
+
+	my $count = undef;
+	eval {
+		my $sth = $self->{dbh}->prepare($sql);
+		$sth->execute();
+		my $row = $sth->fetchrow_arrayref();
+		$count = $row->[0] if ($row);
+		$sth->finish();
+		1;
+	} or do {
+		my $err = $@ || $self->{dbh}->errstr || 'unknown error';
+		$err =~ s/\s+/ /g;
+		$self->logit("DEBUG: empty-LOB probe skipped for $table: $err\n", 1);
+		return undef;
+	};
+	if (!defined $count) {
+		my $err = $self->{dbh}->errstr || '';
+		if ($err ne '') {
+			$err =~ s/\s+/ /g;
+			$self->logit("DEBUG: empty-LOB probe skipped for $table: $err\n", 1);
+			return undef;
+		}
+		return undef;
+	}
+
+	my $populated = ($count > $th) ? 1 : 0;
+	$self->{_blob_probe_cache}{$table} = $populated;
+	$self->logit("DEBUG: empty-LOB probe for $table: $count populated value(s), threshold $th, " . ($populated ? "keeping reduced BLOB chunk.\n" : "keeping full DATA_LIMIT chunk.\n"), 1);
+	return $populated;
 }
 
 =head2 _src_page_size

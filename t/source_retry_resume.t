@@ -1702,4 +1702,99 @@ sub make_obj {
 	}
 }
 
+# BLOB_CHECK_THRESHOLD empty-LOB probe
+{
+	package FakeBlobProbeSTH;
+	sub new { my ($class, $count) = @_; return bless { count => $count }, $class; }
+	sub execute { return 1; }
+	sub fetchrow_arrayref { my $s = shift; return undef if ($s->{done}); $s->{done} = 1; return [$s->{count}]; }
+	sub finish { return 1; }
+	package FakeBlobProbeDBH;
+	sub new { my ($class, %a) = @_; return bless { count => $a{count}, die_on_prepare => $a{die_on_prepare}, prepares => 0, last_sql => '' }, $class; }
+	sub ping { return 1; }
+	sub errstr { return ''; }
+	sub prepare { my ($s, $sql) = @_; $s->{prepares}++; $s->{last_sql} = $sql; die "BOOM" if ($s->{die_on_prepare}); return FakeBlobProbeSTH->new($s->{count}); }
+	package main;
+
+	# Threshold accessor defaults (object bypasses _init)
+	is(make_obj()->_blob_check_threshold(), 20, 'probe threshold defaults to 20');
+	is(make_obj(blob_check_threshold => 0)->_blob_check_threshold(), 0, 'explicit 0 preserved (probe disabled)');
+	is(make_obj(blob_check_threshold => 7)->_blob_check_threshold(), 7, 'explicit value kept');
+	is(make_obj(blob_check_threshold => 'xx')->_blob_check_threshold(), 20, 'invalid falls back to 20');
+
+	# No source connection -> unknown -> legacy reduced chunk
+	{
+		my $o = make_obj(blob_check_threshold => 20);
+		delete $o->{dbh};
+		is($o->_table_has_populated_lobs('T', '"T"', [{ name => '"BC"', src => 'BLOB' }]), undef, 'no dbh yields undef');
+	}
+	# Non-Oracle source -> unknown
+	{
+		my $o = make_obj(blob_check_threshold => 20, is_mssql => 1);
+		$o->{dbh} = FakeBlobProbeDBH->new(count => 25);
+		is($o->_table_has_populated_lobs('T', '"T"', [{ name => '"BC"', src => 'BLOB' }]), undef, 'mssql yields undef');
+	}
+	# Threshold 0 disables probe
+	{
+		my $o = make_obj(blob_check_threshold => 0);
+		$o->{dbh} = FakeBlobProbeDBH->new(count => 25);
+		is($o->_table_has_populated_lobs('T', '"T"', [{ name => '"BC"', src => 'BLOB' }]), undef, 'threshold 0 yields undef');
+	}
+	# Populated table: 21 > 20, ROWNUM cap 21, GETLENGTH branch with privilege
+	{
+		my $o = make_obj(blob_check_threshold => 20, has_dbms_log_execute_privilege => 1);
+		my $dbh = FakeBlobProbeDBH->new(count => 21);
+		$o->{dbh} = $dbh;
+		is($o->_table_has_populated_lobs('T', '"SC"."T"', [{ name => '"BC"', src => 'BLOB' }]), 1, 'count above threshold means populated');
+		like($dbh->{last_sql}, qr/ROWNUM <= 21/, 'probe capped at threshold+1');
+		like($dbh->{last_sql}, qr/DBMS_LOB\.GETLENGTH/, 'probe uses GETLENGTH with privilege');
+		# Cached: no second prepare
+		is($o->_table_has_populated_lobs('T', '"SC"."T"', [{ name => '"BC"', src => 'BLOB' }]), 1, 'cached populated');
+		is($dbh->{prepares}, 1, 'probe runs once per table');
+	}
+	# Empty-ish table: 5 <= 20, no privilege -> IS NOT NULL only
+	{
+		my $o = make_obj(blob_check_threshold => 20, has_dbms_log_execute_privilege => 0);
+		my $dbh = FakeBlobProbeDBH->new(count => 5);
+		$o->{dbh} = $dbh;
+		is($o->_table_has_populated_lobs('T', '"T"', [{ name => '"BC"', src => 'BLOB' }, { name => '"CC"', src => 'CLOB' }]), 0, 'count within threshold means empty-ish');
+		unlike($dbh->{last_sql}, qr/DBMS_LOB\.GETLENGTH/, 'probe without privilege avoids GETLENGTH');
+		like($dbh->{last_sql}, qr/IS NOT NULL/, 'probe filters nulls');
+	}
+	# Probe error never dies, yields undef (legacy chunk kept)
+	{
+		my $o = make_obj(blob_check_threshold => 20);
+		$o->{dbh} = FakeBlobProbeDBH->new(count => 0, die_on_prepare => 1);
+		is($o->_table_has_populated_lobs('T', '"T"', [{ name => '"BC"', src => 'BLOB' }]), undef, 'probe error yields undef');
+	}
+
+	# Wiring in _howto_get_data: empty LOBs keep full DATA_LIMIT chunk
+	sub make_blob_obj {
+		my ($count) = @_;
+		my $o = make_obj(blob_check_threshold => 20, data_limit => 10000, has_dbms_log_execute_privilege => 0);
+		$o->{dbh} = FakeBlobProbeDBH->new(count => $count);
+		$o->{tables}{BT}{table_info} = { nested => 'NO', owner => 'SC', num_rows => 100 };
+		$o->{tables}{BT}{column_info} = { BC => ['BC', 'BLOB', 4000, 'Y', undef, undef, undef, undef, 'BT', '', 'NO', 1] };
+		$o->{colinfo} = { BT => { BC => { nullable => 'Y' } } };
+		$o->{prefix} = 'DBA'; $o->{data_type} = { BLOB => 'bytea' }; $o->{user_type} = {}; $o->{spatial_srid} = {}; $o->{nullable} = {}; $o->{local_data_limit} = {}; $o->{bfile_found} = ''; $o->{empty_lob_null} = 0; $o->{enable_blob_export} = 1; $o->{enable_clob_export} = 1; $o->{trim_type} = 'BOTH'; $o->{trim_char} = ' '; $o->{geometry_extract_type} = 'WKT'; $o->{replace_query} = {}; $o->{_src_resume} = {};
+		return $o;
+	}
+	{
+		my $o = make_blob_obj(0);
+		$o->_howto_get_data('BT', ['BC'], ['bytea'], ['BLOB'], undef, undef);
+		ok(!exists $o->{local_data_limit}{BT}, 'empty LOBs keep full DATA_LIMIT chunk');
+	}
+	{
+		my $o = make_blob_obj(25);
+		$o->_howto_get_data('BT', ['BC'], ['bytea'], ['BLOB'], undef, undef);
+		is($o->{local_data_limit}{BT}, 1000, 'populated LOBs keep reduced BLOB chunk');
+	}
+	{
+		my $o = make_blob_obj(0);
+		$o->{blob_limit} = 500;
+		$o->_howto_get_data('BT', ['BC'], ['bytea'], ['BLOB'], undef, undef);
+		is($o->{local_data_limit}{BT}, 500, 'explicit BLOB_LIMIT wins over empty probe');
+	}
+}
+
 done_testing();

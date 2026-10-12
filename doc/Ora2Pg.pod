@@ -1850,6 +1850,22 @@ value of this directive by dividing it by 10 until his value is below 1000.
 You can control this value by setting BLOB_LIMIT. Exporting BLOB use lot of
 resources, setting it to a too high value can produce OOM.
 
+=item BLOB_CHECK_THRESHOLD
+
+Read-only empty-LOB probe used before applying the BLOB chunk reduction
+above. Ora2Pg counts populated LOB values (IS NOT NULL and length > 0)
+up to BLOB_CHECK_THRESHOLD + 1 with a single cheap query capped by
+ROWNUM: if more than this threshold is found the table is treated as a
+BLOB table and the reduced chunk applies, otherwise the full DATA_LIMIT
+chunk is kept. This avoids the 10x slowdown on tables whose BLOB/CLOB
+columns are all (or almost all) NULL, where the reduction triggers on
+column type alone. Default: 20. Set to 0 to disable the probe and keep
+the legacy behavior (always reduced chunk on LOB types). An explicit
+BLOB_LIMIT always wins over the probe. Oracle only; on probe error the
+reduced chunk is kept conservatively. The threshold bounds the row
+count, not the byte size: with huge LOBs lower it or set BLOB_LIMIT
+explicitly.
+
 =item SOURCE_PAGE_SIZE
 
 Keyset pagination of source queries in the single-process direct-PG

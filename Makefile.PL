@@ -945,6 +945,14 @@ DATA_LIMIT	$DATA_LIMIT_DEFAULT
 # ressources, setting it to a too high value can produce OOM.
 #BLOB_LIMIT	500
 
+# Read-only empty-LOB probe before applying the BLOB chunk reduction.
+# Counts populated LOB values up to THRESHOLD+1 (ROWNUM capped): above
+# the threshold the reduced chunk applies, otherwise full DATA_LIMIT is
+# kept. Avoids the slowdown on tables with all/nearly-all NULL LOBs.
+# Default 20. 0 disables the probe (legacy: always reduced chunk).
+# An explicit BLOB_LIMIT always wins. Oracle only.
+#BLOB_CHECK_THRESHOLD	20
+
 # Keyset pagination of source queries in the single-process direct-PG
 # COPY/INSERT path (Oracle/MSSQL, single exact-numeric PK). Each page is an
 # ordered query limited to N rows from the last confirmed checkpoint.
